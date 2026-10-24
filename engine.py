@@ -511,11 +511,32 @@ def tts_edge(text, voice, rate_pct, out_path):
     return out_path
 
 
-def tts_gemini(api_key, models, text, voice, language, out_path, log=lambda m: None):
+LANG_EN = {
+    "الدارجة المغربية": "Moroccan Arabic (Darija)", "الأمازيغية": "Moroccan Tamazight",
+    "العربية الفصحى": "Modern Standard Arabic", "المصرية": "Egyptian Arabic", "الخليجية": "Gulf Arabic",
+    "السورية": "Syrian Arabic", "اللبنانية": "Lebanese Arabic", "العراقية": "Iraqi Arabic",
+    "الأردنية": "Jordanian Arabic", "الإماراتية": "Emirati Arabic", "السعودية": "Saudi Arabic",
+    "التونسية": "Tunisian Arabic", "الجزائرية": "Algerian Arabic", "الإنجليزية": "English",
+    "الفرنسية": "French", "الإسبانية": "Spanish", "الألمانية": "German", "التركية": "Turkish",
+}
+LANG_CODE = {"الإنجليزية": "en", "الفرنسية": "fr", "الإسبانية": "es", "الألمانية": "de", "التركية": "tr"}  # الباقي = ar
+DEFAULT_TTS_SPACES = ["ResembleAI/Chatterbox"]
+DEFAULT_STYLE = "natural, warm, expressive storytelling voice with realistic human pacing and emotion"
+
+
+def gemini_tts_prompt(text, language, style, multi=False):
+    lang = LANG_EN.get(language, language)
+    p = f"Read aloud in {lang}, in a {style or DEFAULT_STYLE}."
+    if multi:
+        p += " Leave a clear pause of about one second between paragraphs."
+    return p + "\n\n" + text
+
+
+def tts_gemini(api_key, models, text, voice, language, out_path, style="", multi=False, log=lambda m: None):
     from google import genai
     from google.genai import types
     client = genai.Client(api_key=api_key)
-    prompt = f"قل بلهجة {language} وبنبرة طبيعية: {text}"
+    prompt = gemini_tts_prompt(text, language, style, multi)
     last = None
     for m in models:
         for attempt in range(3):
@@ -536,13 +557,70 @@ def tts_gemini(api_key, models, text, voice, language, out_path, log=lambda m: N
                 last = e
                 msg = str(e)
                 if "429" in msg or "RESOURCE_EXHAUSTED" in msg:
-                    wait = 12 * (attempt + 1)
+                    # حصة يومية منتهية → لا فائدة من الانتظار
+                    if "per_day" in msg.lower() or "PerDay" in msg or "free_tier_requests" in msg:
+                        log("⚠️ الحصة اليومية المجانية لـ Gemini TTS انتهت.")
+                        raise RuntimeError("Gemini TTS: الحصة اليومية المجانية انتهت (حوالي 10 طلبات في اليوم)")
+                    wait = 15 * (attempt + 1)
                     log(f"حد الطلبات وصل، نعاود بعد {wait} ثانية…")
                     time.sleep(wait)
                     continue
                 log(f"نموذج الصوت {m}: {msg[:110]}")
                 break
-    raise RuntimeError(f"Gemini TTS فشل: {last}")
+    raise RuntimeError(f"Gemini TTS فشل: {str(last)[:200]}")
+
+
+def tts_hf(spaces, text, language, out_dir, token=None, log=lambda m: None):
+    """Chatterbox Multilingual (MIT) عبر Hugging Face Space. يدعم العربية الفصحى (ليس الدارجة)."""
+    code = LANG_CODE.get(language, "ar")
+    path, used = hf_audio(spaces, text, None, out_dir, token, timeout=180, log=log,
+                          extra={"lang": code})
+    return path, used
+
+
+# ---------- تقسيم صوت طويل إلى مشاهد (طلب Gemini واحد لعدة مشاهد) ----------
+def detect_silences(path, noise_db=-32, min_d=0.22):
+    r = subprocess.run([FFMPEG, "-hide_banner", "-i", path, "-af", f"silencedetect=noise={noise_db}dB:d={min_d}",
+                        "-f", "null", "-"], capture_output=True, text=True)
+    starts = [float(x) for x in re.findall(r"silence_start:\s*(-?[\d.]+)", r.stderr)]
+    ends = [float(x) for x in re.findall(r"silence_end:\s*([\d.]+)", r.stderr)]
+    return [(max(0.0, a), b) for a, b in zip(starts, ends)]
+
+
+def split_audio_by_text(path, texts, out_prefix):
+    """يقطع ملفاً صوتياً واحداً إلى أجزاء بعدد النصوص، عند أقرب فراغ صامت للحدود المتوقعة (حسب طول كل نص)."""
+    total = media_duration(path)
+    weights = [max(1, len(re.sub(r"\s+", "", t))) for t in texts]
+    wsum = float(sum(weights))
+    acc, expected = 0.0, []
+    for w in weights:
+        acc += w
+        expected.append(acc / wsum * total)
+    sil = detect_silences(path)
+    bounds = [0.0]
+    for i in range(len(texts) - 1):
+        span = weights[i] / wsum * total
+        window = max(1.2, 0.35 * span)
+        best, best_score = None, None
+        for a, b in sil:
+            mid = (a + b) / 2
+            if abs(mid - expected[i]) <= window and mid > bounds[-1] + 0.8:
+                score = abs(mid - expected[i]) - 1.5 * (b - a)  # نفضّل الفراغ الأطول والأقرب
+                if best_score is None or score < best_score:
+                    best, best_score = mid, score
+        bounds.append(best if best is not None else expected[i])
+    bounds.append(total)
+    outs = []
+    for i in range(len(texts)):
+        a, b = bounds[i], max(bounds[i] + 0.5, bounds[i + 1])
+        out = f"{out_prefix}_{i}.wav"
+        r = subprocess.run([FFMPEG, "-y", "-ss", f"{a:.3f}", "-to", f"{b:.3f}", "-i", path,
+                            "-af", "afade=t=in:d=0.015", "-ar", "24000", "-ac", "1", out],
+                           capture_output=True, text=True)
+        if r.returncode != 0:
+            raise RuntimeError(r.stderr[-300:])
+        outs.append(out)
+    return outs
 
 
 # ============================================================
@@ -569,23 +647,45 @@ def search_freesound(query, api_key):
     return None
 
 
-def ace_music(prompt, duration, api_key, timeout=300):
-    """ACE Music السحابي: endpoint متوافق مع OpenAI → /v1/chat/completions (وليس /v1/music/generate)."""
+ACE_BASE = "https://api.acemusic.ai"
+
+
+def ace_models(api_key):
+    try:
+        r = requests.get(f"{ACE_BASE}/v1/models", headers={"Authorization": f"Bearer {api_key}"}, timeout=15)
+        if r.status_code == 200:
+            data = r.json().get("data") or []
+            if data:
+                return data[0].get("id")
+    except Exception:
+        pass
+    return "acemusic/acestep-v15-turbo"
+
+
+def ace_music(prompt, duration, api_key, timeout=180):
+    """ACE-Step السحابي (رخصة MIT/Apache، استعمال تجاري مسموح). endpoint متوافق مع OpenAI:
+    POST /v1/chat/completions مع حقل model إجباري، والصوت يرجع base64."""
+    api_key = (api_key or "").strip()
     if not api_key:
-        raise RuntimeError("لا يوجد مفتاح ACE Music (احصل عليه مجاناً من acemusic.ai/playground/api-key)")
+        raise RuntimeError("لا يوجد مفتاح ACE Music (مجاني من acemusic.ai)")
+    model = ace_models(api_key)
     payload = {
+        "model": model,
         "messages": [{"role": "user", "content": f"<prompt>{prompt}, instrumental, no vocals</prompt>"}],
         "stream": False,
-        "audio_config": {"duration": int(duration), "instrumental": True, "format": "mp3"},
+        "audio_config": {"duration": int(duration), "instrumental": True},
     }
-    r = requests.post("https://api.acemusic.ai/v1/chat/completions",
+    r = requests.post(f"{ACE_BASE}/v1/chat/completions",
                       headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-                      json=payload, timeout=timeout)
+                      json=payload, timeout=(10, timeout))
     if r.status_code == 401:
         raise RuntimeError("مفتاح ACE Music غير صالح (401)")
     if r.status_code >= 400:
-        raise RuntimeError(f"ACE Music {r.status_code}: {r.text[:200]}")
-    msg = r.json()["choices"][0]["message"]
+        raise RuntimeError(f"ACE Music {r.status_code}: {r.text[:240]}")
+    data = r.json()
+    if "choices" not in data:
+        raise RuntimeError(f"رد غير متوقع من ACE: {str(data)[:200]}")
+    msg = data["choices"][0]["message"]
     url = None
     for a in (msg.get("audio") or []):
         url = (a.get("audio_url") or {}).get("url")
@@ -599,6 +699,56 @@ def ace_music(prompt, duration, api_key, timeout=300):
     if url.startswith("data:"):
         return base64.b64decode(url.split(",", 1)[1]), "mp3"
     return requests.get(url, timeout=120).content, "mp3"
+
+
+MUSIC_WORDS = ["ambient", "cinematic", "epic", "lofi", "piano", "guitar", "electronic", "dark", "upbeat", "calm",
+               "orchestral", "acoustic", "jazz", "funk", "hip hop", "synth", "drone", "tense", "happy", "sad"]
+
+
+def suggest_music_query(prompt, tone=""):
+    t = (prompt or "").lower()
+    found = [w for w in MUSIC_WORDS if w in t][:3]
+    return " ".join(found) if found else "ambient background"
+
+
+def search_music_library(query, freesound_key=None, n=6):
+    """موسيقى بلا حقوق: Freesound (CC0) + Openverse (CC0 / Public Domain). كلاهما آمن للاستعمال التجاري بلا إسناد."""
+    res, errs = [], []
+    if freesound_key:
+        for q in (query, " ".join(query.split()[:2])):
+            try:
+                r = requests.get("https://freesound.org/apiv2/search/text/",
+                                 headers={"Authorization": f"Token {freesound_key}"},
+                                 params={"query": q, "fields": "id,name,previews,duration,username,license",
+                                         "filter": 'tag:music license:"Creative Commons 0" duration:[20 TO 300]',
+                                         "page_size": n, "sort": "rating_desc"}, timeout=15)
+                if r.status_code == 401:
+                    errs.append("Freesound: مفتاح غير صالح")
+                    break
+                r.raise_for_status()
+                for it in r.json().get("results", []):
+                    pv = it.get("previews", {})
+                    url = pv.get("preview-hq-mp3") or pv.get("preview-lq-mp3")
+                    if url:
+                        res.append({"title": it.get("name", ""), "url": url, "duration": float(it.get("duration") or 0),
+                                    "source": "Freesound", "license": "CC0", "creator": it.get("username", "")})
+                if res:
+                    break
+            except Exception as e:
+                errs.append(f"Freesound: {str(e)[:100]}")
+                break
+    try:
+        r = requests.get("https://api.openverse.org/v1/audio/", headers=UA,
+                         params={"q": query, "license": "cc0,pdm", "category": "music", "page_size": n}, timeout=15)
+        r.raise_for_status()
+        for it in r.json().get("results", []):
+            if it.get("url"):
+                res.append({"title": it.get("title") or "", "url": it["url"],
+                            "duration": (it.get("duration") or 0) / 1000.0, "source": "Openverse · " + str(it.get("source", "")),
+                            "license": str(it.get("license", "")).upper(), "creator": it.get("creator") or ""})
+    except Exception as e:
+        errs.append(f"Openverse: {str(e)[:100]}")
+    return res[: n * 2], errs
 
 
 _AUDIO_EXT = (".wav", ".mp3", ".flac", ".ogg", ".m4a")
@@ -628,7 +778,7 @@ def _find_audio(obj):
     return None
 
 
-def _hf_kwargs(params, prompt, duration):
+def _hf_kwargs(params, prompt, duration, extra=None):
     kw, used = {}, False
     for p in params:
         key = p.get("parameter_name")
@@ -646,7 +796,9 @@ def _hf_kwargs(params, prompt, duration):
         elif comp in ("audio", "file", "image", "video"):
             if not has_def:
                 kw[key] = None
-        elif any(w in blob for w in ("duration", "seconds", "length")) and ptype in ("float", "int", "number", ""):
+        elif extra and any(k in blob for k in extra):
+            kw[key] = next(v for k, v in extra.items() if k in blob)
+        elif duration is not None and any(w in blob for w in ("duration", "seconds", "length")) and ptype in ("float", "int", "number", ""):
             kw[key] = float(duration) if "int" not in ptype else int(duration)
         elif (not used) and (comp == "textbox" or ptype == "str") and \
                 any(w in blob for w in ("prompt", "text", "caption", "description", "tags", "style", "query")):
@@ -672,7 +824,7 @@ def _hf_kwargs(params, prompt, duration):
     return kw if used else None
 
 
-def hf_audio(spaces, prompt, duration, out_dir, token=None, timeout=240, log=lambda m: None):
+def hf_audio(spaces, prompt, duration, out_dir, token=None, timeout=240, log=lambda m: None, extra=None):
     """يجرّب Hugging Face Spaces واحداً واحداً، ويكتشف تلقائياً الـ endpoint والمعاملات."""
     from gradio_client import Client
     errors = []
@@ -691,7 +843,7 @@ def hf_audio(spaces, prompt, duration, out_dir, token=None, timeout=240, log=lam
             for name, info in eps.items():
                 if any(w in name.lower() for w in ("load", "clear", "reset", "stop", "lambda", "example")):
                     continue
-                kw = _hf_kwargs(info.get("parameters", []), prompt, duration)
+                kw = _hf_kwargs(info.get("parameters", []), prompt, duration, extra)
                 if not kw:
                     continue
                 try:
@@ -731,7 +883,8 @@ def search_pexels(query, key, orient, n=6):
         if not files:
             continue
         best = min(files, key=lambda f: abs(min(f.get("width") or 0, f.get("height") or 0) - 720))
-        out.append({"source": "Pexels", "thumb": v.get("image"), "url": best["link"], "duration": v.get("duration")})
+        out.append({"source": "Pexels", "thumb": v.get("image"), "url": best["link"], "preview": best["link"],
+                    "duration": v.get("duration")})
     return out
 
 
@@ -743,12 +896,26 @@ def search_pixabay(query, key, n=6):
     for h in r.json().get("hits", []):
         vids = h.get("videos", {})
         pick = vids.get("medium") or vids.get("small") or vids.get("large") or vids.get("tiny")
+        prev = vids.get("tiny") or vids.get("small") or pick
         if not pick or not pick.get("url"):
             continue
-        pic = h.get("picture_id")
-        thumb = f"https://i.vimeocdn.com/video/{pic}_640x360.jpg" if pic else None
-        out.append({"source": "Pixabay", "thumb": thumb, "url": pick["url"], "duration": h.get("duration")})
+        thumb = (pick.get("thumbnail") or prev.get("thumbnail") or None) if isinstance(pick, dict) else None
+        out.append({"source": "Pixabay", "thumb": thumb, "url": pick["url"],
+                    "preview": (prev or pick).get("url"), "duration": h.get("duration")})
     return out
+
+
+def make_thumb(video_url, dest, timeout=25):
+    """يلتقط صورة مصغّرة من الفيديو مباشرة (بدون الاعتماد على أي CDN للصور)."""
+    if os.path.exists(dest) and os.path.getsize(dest) > 500:
+        return dest
+    ua = ["-user_agent", "Mozilla/5.0"] if str(video_url).startswith("http") else []
+    r = subprocess.run([FFMPEG, "-y", *ua, "-ss", "0.6", "-i", video_url,
+                        "-frames:v", "1", "-vf", "scale=360:-2", dest],
+                       capture_output=True, text=True, timeout=timeout)
+    if r.returncode != 0 or not os.path.exists(dest):
+        raise RuntimeError(r.stderr[-200:])
+    return dest
 
 
 def find_clips(query, orient, pexels_key, pixabay_key, n=6):
@@ -1082,3 +1249,72 @@ def render_project(project, assets, cfg, timeline, music_path, out_path, work_di
             pass
     progress(1.0, "الفيديو جاهز")
     return out_path
+
+
+# ============================================================
+# فحص الخدمات (تشخيص)
+# ============================================================
+def check_services(keys):
+    out = []
+
+    def run(name, fn):
+        t = time.time()
+        try:
+            msg = fn()
+            out.append((name, True, f"{msg} · {time.time() - t:.1f}s"))
+        except Exception as e:
+            out.append((name, False, str(e)[:220]))
+
+    def t_gemini():
+        if not keys.get("gemini"):
+            raise RuntimeError("لا يوجد مفتاح")
+        from google import genai
+        c = genai.Client(api_key=keys["gemini"])
+        n = sum(1 for _ in zip(range(3), c.models.list()))
+        return f"المفتاح صالح ({n}+ نماذج)"
+
+    def t_ace():
+        if not keys.get("ace"):
+            raise RuntimeError("لا يوجد مفتاح")
+        r = requests.get(f"{ACE_BASE}/v1/models", headers={"Authorization": f"Bearer {keys['ace']}"}, timeout=15)
+        if r.status_code == 401:
+            raise RuntimeError("مفتاح غير صالح (401)")
+        r.raise_for_status()
+        return "المفتاح صالح · " + str((r.json().get("data") or [{}])[0].get("id", ""))
+
+    def t_fs():
+        if not keys.get("freesound"):
+            raise RuntimeError("لا يوجد مفتاح")
+        r = search_freesound("rain", keys["freesound"])
+        return "المفتاح صالح" if r is not None else "المفتاح صالح (لا نتائج)"
+
+    def t_pexels():
+        if not keys.get("pexels"):
+            raise RuntimeError("لا يوجد مفتاح")
+        return f"{len(search_pexels('nature', keys['pexels'], 'landscape', 1))} نتيجة"
+
+    def t_pix():
+        if not keys.get("pixabay"):
+            raise RuntimeError("لا يوجد مفتاح")
+        return f"{len(search_pixabay('nature', keys['pixabay'], 3))} نتيجة"
+
+    def t_ov():
+        res, errs = search_music_library("ambient", None, 2)
+        if not res:
+            raise RuntimeError("; ".join(errs) or "لا نتائج")
+        return f"{len(res)} مسار CC0"
+
+    def t_edge():
+        import tempfile
+        p = os.path.join(tempfile.gettempdir(), "edge_probe.mp3")
+        tts_edge("مرحبا", "ar-MA-JamalNeural", 0, p)
+        return "يعمل"
+
+    run("Gemini", t_gemini)
+    run("ACE Music", t_ace)
+    run("Freesound", t_fs)
+    run("Pexels", t_pexels)
+    run("Pixabay", t_pix)
+    run("Openverse (موسيقى CC0)", t_ov)
+    run("Edge TTS", t_edge)
+    return out

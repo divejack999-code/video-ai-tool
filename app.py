@@ -1,12 +1,14 @@
 # -*- coding: utf-8 -*-
+import copy
 import hashlib
 import json
 import os
 import re
 import shutil
-import tempfile
+import threading
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 
 import streamlit as st
 
@@ -27,11 +29,13 @@ TONES = ["الكوميدية", "الأكشن والرسوم المتحركة", "
          "ما بعد الكارثة / النجاة المستقبلية", "الفانتازيا والأسطوريات", "الجريمة والسرقة",
          "التشويق", "الرعب", "الإثارة", "الدراما", "إعلاني (تجاري)"]
 PACES = {"سريع (≈4 ث / مشهد)": 4, "متوسط (≈7 ث / مشهد)": 7, "هادئ (≈10 ث / مشهد)": 10}
-VOICE_ENGINES = ["Edge TTS (مجاني · لهجات عربية)", "Gemini TTS"]
+VOICE_ENGINES = ["Gemini TTS (صوت بشري · الأفضل)", "Chatterbox (Hugging Face · تجريبي)", "Edge TTS (سريع · أقل طبيعية)"]
 SFX_MODES = ["تلقائي (Freesound ← ذكاء اصطناعي ← توليد محلي)", "Freesound فقط",
              "ذكاء اصطناعي (Hugging Face) فقط", "توليد محلي فقط"]
-MUSIC_MODES = ["تلقائي (ACE Music ← Hugging Face ← توليد محلي)", "ACE Music (سحابي مجاني)",
-               "Hugging Face Spaces", "توليد محلي (بدون إنترنت)", "رفع ملف موسيقى", "بدون موسيقى"]
+MUSIC_MODES = ["تلقائي (ACE-Step ← مكتبة CC0 ← توليد محلي)", "ACE-Step (ذكاء اصطناعي · استعمال تجاري)",
+               "مكتبة موسيقى مجانية بلا حقوق (CC0)", "Hugging Face Spaces", "توليد محلي (بدون إنترنت)",
+               "رفع ملف موسيقى", "بدون موسيقى"]
+M_AUTO, M_ACE, M_LIB, M_HF, M_LOCAL, M_UP, M_NONE = MUSIC_MODES
 
 CFG = {
     "cfg_language": "الدارجة المغربية", "cfg_tone": "الكوميدية", "cfg_duration": 60,
@@ -42,12 +46,13 @@ CFG = {
     "cfg_vol_voice": 100, "cfg_vol_sfx": 55, "cfg_vol_music": 18, "cfg_duck": True,
     "cfg_captions": True, "cfg_cap_size": 56, "cfg_cap_color": "#FFFFFF", "cfg_cap_pos": "أسفل",
     "cfg_watermark": "",
+    "cfg_tts_style": E.DEFAULT_STYLE, "cfg_tts_spaces": "\n".join(E.DEFAULT_TTS_SPACES),
     "cfg_music_spaces": "\n".join(E.DEFAULT_MUSIC_SPACES),
     "cfg_sfx_spaces": "\n".join(E.DEFAULT_SFX_SPACES),
 }
 STATE_KEYS = list(CFG) + ["project", "assets", "step", "gen_id", "last_custom_script", "topic",
                           "music_prompt", "music_path", "music_info", "voice_mode", "master_audio_path",
-                          "sfx_mode", "music_mode", "final_path"]
+                          "sfx_mode", "music_mode", "final_path", "music_query", "music_results"]
 
 ss = st.session_state
 
@@ -127,6 +132,13 @@ if "_loaded" not in ss:
                     ss[k] = saved[k]
         except Exception:
             pass
+    # قيم قديمة لم تعد موجودة في الخيارات → ارجع للافتراضي (وإلا يتعطل selectbox)
+    for _k, _opts in (("cfg_voice_engine", VOICE_ENGINES), ("cfg_pace", list(PACES)), ("cfg_aspect", list(E.ASPECTS)),
+                      ("cfg_language", LANGS), ("cfg_tone", TONES), ("sfx_mode", SFX_MODES), ("music_mode", MUSIC_MODES)):
+        if ss.get(_k) not in _opts:
+            ss[_k] = CFG.get(_k, _opts[0])
+    ss.setdefault("music_query", "")
+    ss.setdefault("music_results", [])
     cleanup_old_projects()
     ss["_loaded"] = True
 
@@ -212,10 +224,12 @@ with st.sidebar:
         c2.selectbox("FPS", [24, 30], key="cfg_fps")
     with st.expander("🎙️ الصوت"):
         st.selectbox("محرك التعليق الصوتي", VOICE_ENGINES, key="cfg_voice_engine")
-        _edge = ss.cfg_voice_engine.startswith("Edge")
-        st.radio("صوت Edge", ["ذكر", "أنثى"], horizontal=True, key="cfg_gender", disabled=not _edge)
-        st.slider("سرعة Edge (%)", -30, 40, key="cfg_voice_rate", disabled=not _edge)
-        st.selectbox("صوت Gemini", E.GEMINI_VOICES, key="cfg_gemini_voice", disabled=_edge)
+        _k = "gemini" if ss.cfg_voice_engine.startswith("Gemini") else "hf" if ss.cfg_voice_engine.startswith("Chatter") else "edge"
+        st.selectbox("صوت Gemini", E.GEMINI_VOICES, key="cfg_gemini_voice", disabled=_k != "gemini")
+        st.text_input("أسلوب الأداء (Gemini)", key="cfg_tts_style", disabled=_k != "gemini",
+                      help="مثال: playful comedic voice / calm documentary narrator / dramatic and tense")
+        st.radio("صوت Edge", ["ذكر", "أنثى"], horizontal=True, key="cfg_gender", disabled=_k != "edge")
+        st.slider("سرعة Edge (%)", -30, 40, key="cfg_voice_rate", disabled=_k != "edge")
     with st.expander("🎚️ المزج"):
         st.slider("الصوت %", 0, 150, key="cfg_vol_voice")
         st.slider("المؤثرات %", 0, 150, key="cfg_vol_sfx")
@@ -247,6 +261,14 @@ with st.sidebar:
         st.text_input("نموذج Gemini TTS", key="cfg_tts_model")
         st.text_area("Spaces للموسيقى (سطر لكل Space)", key="cfg_music_spaces", height=90)
         st.text_area("Spaces للمؤثرات (سطر لكل Space)", key="cfg_sfx_spaces", height=90)
+        st.text_area("Spaces للصوت Chatterbox (سطر لكل Space)", key="cfg_tts_spaces", height=70)
+    with st.expander("🩺 فحص الخدمات"):
+        st.caption("كيجرب كل مفتاح/خدمة ويقول ليك شكون خدام وشكون لا، مع سبب الخطأ.")
+        if st.button("تشغيل الفحص", width="stretch"):
+            with st.spinner("…"):
+                _res = E.check_services({n: key(n) for n in ("gemini", "ace", "freesound", "pexels", "pixabay")})
+            for _n, _ok, _m in _res:
+                st.markdown(f"{'✅' if _ok else '❌'} **{_n}** — {_m}")
     st.divider()
     if st.button("🗑️ مشروع جديد (مسح كل شيء)", width="stretch"):
         shutil.rmtree(PDIR, ignore_errors=True)
@@ -311,6 +333,88 @@ def timeline():
 
 
 # ============================================================
+# التركيب في الخلفية (يستمر حتى لو تحدّثت الصفحة)
+# ============================================================
+STATUS_FILE = os.path.join(PDIR, "render.json")
+
+
+def read_status():
+    try:
+        with open(STATUS_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def write_status(d):
+    try:
+        d["ts"] = time.time()
+        tmp = STATUS_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(d, f, ensure_ascii=False)
+        os.replace(tmp, STATUS_FILE)
+    except Exception:
+        pass
+
+
+def render_alive():
+    return any(t.name == f"render-{pid}" and t.is_alive() for t in threading.enumerate())
+
+
+def _render_worker(project, assets, cfg, tl, music_path, out, work_dir, font_dir, master_audio, clip_jobs, vdir, status_file):
+    def put(state, **kw):
+        kw["state"] = state
+        write_status(kw)
+
+    try:
+        n = max(1, len(clip_jobs))
+        for i, (sn, url) in enumerate(clip_jobs.items()):
+            put("running", progress=0.05 * i / n, msg=f"تحميل مقاطع الفيديو {i + 1}/{n}")
+            try:
+                dest = os.path.join(vdir, hashlib.md5(url.encode()).hexdigest()[:12] + ".mp4")
+                assets.setdefault(sn, {})["clip_path"] = E.download_file(url, dest)
+            except Exception:
+                assets.setdefault(sn, {})["clip_path"] = None
+        shutil.rmtree(work_dir, ignore_errors=True)
+        os.makedirs(work_dir, exist_ok=True)
+        E.render_project(project, assets, cfg, tl, music_path, out, work_dir, font_dir, master_audio_path=master_audio,
+                         progress=lambda f, m: put("running", progress=0.05 + 0.95 * f, msg=m))
+        put("done", progress=1.0, out=out, msg="الفيديو جاهز")
+    except Exception as e:
+        put("error", msg=str(e)[:600])
+
+
+def render_panel():
+    stt = read_status()
+    state = stt.get("state")
+    if state == "running" and not render_alive() and time.time() - stt.get("ts", 0) > 60:
+        state = "stalled"
+    if state == "running":
+        st.progress(min(1.0, float(stt.get("progress", 0))), text=stt.get("msg", "…"))
+        st.caption("التركيب خدام فالخلفية. تقدر تنتظر هنا أو تسد الصفحة وترجع من بعد بنفس الرابط.")
+    elif state == "done" and stt.get("out") and os.path.exists(stt["out"]):
+        if ss.get("final_path") != stt["out"]:
+            ss.final_path = stt["out"]
+            save_state()
+            st.rerun()
+        show_final(stt["out"])
+    elif state == "error":
+        st.error(f"وقع مشكل أثناء التركيب: {stt.get('msg', '')}")
+    elif state == "stalled":
+        st.error("توقف التركيب فجأة، غالباً السيرفر المجاني فرغت ذاكرتو. نقّص الجودة لـ 720p أو 480p، أو قصّر الفيديو، وعاود.")
+    elif ss.get("final_path") and os.path.exists(ss.final_path):
+        show_final(ss.final_path)
+
+
+def show_final(path):
+    st.success(f"✅ الفيديو النهائي جاهز · {E.media_duration(path):.0f} ثانية · {os.path.getsize(path) / 1e6:.1f} MB")
+    st.video(path)
+    with open(path, "rb") as f:
+        st.download_button("⬇️ تحميل الفيديو (MP4)", f, file_name="ai_studio_video.mp4", mime="video/mp4",
+                           width="stretch", key=f"dl_{os.path.basename(path)}")
+
+
+# ============================================================
 # الشريط العلوي + الخطوات
 # ============================================================
 st.markdown(
@@ -339,7 +443,7 @@ with side:
             tl = timeline()
             ok_v = sum(1 for s in sc if A(s["scene_number"]).get("audio_path")) if ss.voice_mode == "per_scene" else (len(sc) if master_dur() else 0)
             ok_s = sum(1 for s in sc if any(e.get("path") for e in A(s["scene_number"]).get("sfx", [])))
-            ok_c = sum(1 for s in sc if A(s["scene_number"]).get("clip_path") or A(s["scene_number"]).get("clip_idx") == -1)
+            ok_c = sum(1 for s in sc if A(s["scene_number"]).get("clip_path") or A(s["scene_number"]).get("clip_idx", -1) >= 0)
             segs = "".join(
                 f"<i style='flex:{max(it['dur'], 0.5):.2f}' title='المشهد {it['n']} · {it['dur']:.1f}s'>{it['n']}</i>"
                 for it in tl["items"])
@@ -392,6 +496,7 @@ with main:
                         ss.assets = {}
                         ss.gen_id += 1
                         ss.music_prompt = ss.project["music_prompt"]
+                        ss.music_query, ss.music_results = "", []
                         ss.music_path = None
                         ss.master_audio_path = None
                         ss.final_path = None
@@ -439,58 +544,102 @@ with main:
                           index=0 if ss.voice_mode == "per_scene" else 1, label_visibility="collapsed")
             ss.voice_mode = "per_scene" if vm.startswith("توليد") else "master"
             if ss.voice_mode == "per_scene":
-                edge = ss.cfg_voice_engine.startswith("Edge")
-                desc = ("Edge TTS: أصوات عربية حقيقية بلهجات (المغرب، مصر، السعودية…) بدون مفتاح."
-                        if edge else "Gemini TTS: يحتاج مفتاح Gemini وله حد يومي للطلبات.")
-                st.caption(f"المحرك الحالي: **{ss.cfg_voice_engine}**. {desc} (تغيّره من الشريط الجانبي)")
+                kind = "gemini" if ss.cfg_voice_engine.startswith("Gemini") else \
+                    "hf" if ss.cfg_voice_engine.startswith("Chatter") else "edge"
+                notes = {
+                    "gemini": "Gemini TTS: أقرب صوت لـ Google AI Studio، يفهم اللهجة والأسلوب. الحصة المجانية صغيرة "
+                              "(حوالي 10 طلبات في اليوم)، لذلك التطبيق يجمّع عدة مشاهد في طلب واحد ويقطّع الصوت تلقائياً.",
+                    "hf": "Chatterbox (رخصة MIT) عبر Hugging Face: مجاني، يدعم العربية الفصحى (ماشي الدارجة)، وعلى حصة GPU محدودة.",
+                    "edge": "Edge TTS: سريع وبلا مفتاح، لكن صوته أقل طبيعية، وهو واجهة غير رسمية (الأفضل تفاديه للاستعمال التجاري).",
+                }
+                st.caption(f"المحرك الحالي: **{ss.cfg_voice_engine}**. {notes[kind]} (تغيّره من الشريط الجانبي)")
+                if kind == "gemini" and not key("gemini"):
+                    st.warning("ما كاين مفتاح Gemini، غادي نرجعو لـ Edge TTS تلقائياً.")
                 cA, cB = st.columns([2, 1])
                 run_all = cA.button("🎙️ توليد أصوات المشاهد الناقصة", type="primary", width="stretch")
                 redo_all = cB.button("إعادة توليد الكل", width="stretch")
 
-                def make_voice(s, status=None):
-                    n = s["scene_number"]
-                    txt = s["dialogue"].strip()
-                    if not txt:
-                        return
-                    out = os.path.join(ADIR, f"voice_{n}_{int(time.time())}.{'mp3' if edge else 'wav'}")
-                    log = (lambda m: status.write(m)) if status else (lambda m: None)
-                    engines = ["edge", "gemini"] if edge else ["gemini", "edge"]
-                    err = []
-                    for eng in engines:
+                def set_voice(s, path, eng):
+                    a = A(s["scene_number"])
+                    a["audio_path"] = path
+                    a["audio_dur"] = E.media_duration(path)
+                    a["audio_engine"] = eng
+
+                def edge_one(s):
+                    fem, mal = E.EDGE_VOICES[ss.cfg_language]
+                    out = os.path.join(ADIR, f"voice_{s['scene_number']}_{int(time.time() * 1000)}.mp3")
+                    E.tts_edge(s["dialogue"].strip(), fem if ss.cfg_gender == "أنثى" else mal, ss.cfg_voice_rate, out)
+                    set_voice(s, out, "edge")
+
+                def group_scenes(scs, max_chars=1300, max_n=8):
+                    groups, cur, chars = [], [], 0
+                    for s in scs:
+                        n = len(s["dialogue"])
+                        if cur and (chars + n > max_chars or len(cur) >= max_n):
+                            groups.append(cur)
+                            cur, chars = [], 0
+                        cur.append(s)
+                        chars += n
+                    if cur:
+                        groups.append(cur)
+                    return groups
+
+                def gen_voices(todo, stt):
+                    todo = [s for s in todo if s["dialogue"].strip()]
+                    errors = []
+                    remaining = list(todo)
+                    if kind == "gemini" and key("gemini"):
+                        models = [ss.cfg_tts_model] + [m for m in E.GEMINI_TTS_MODELS if m != ss.cfg_tts_model]
+                        failed, quota_out = [], False
+                        for g in group_scenes(remaining):
+                            if quota_out:
+                                failed += g
+                                continue
+                            try:
+                                stt.write(f"Gemini: المشاهد {g[0]['scene_number']}–{g[-1]['scene_number']} في طلب واحد")
+                                raw = os.path.join(ADIR, f"gem_{int(time.time() * 1000)}.wav")
+                                E.tts_gemini(key("gemini"), models, "\n\n".join(s["dialogue"].strip() for s in g),
+                                             ss.cfg_gemini_voice, ss.cfg_language, raw, style=ss.cfg_tts_style,
+                                             multi=len(g) > 1, log=stt.write)
+                                parts = [raw] if len(g) == 1 else E.split_audio_by_text(
+                                    raw, [s["dialogue"] for s in g], raw[:-4])
+                                for s, p in zip(g, parts):
+                                    set_voice(s, p, "gemini")
+                            except Exception as e:
+                                stt.write(f"⚠️ {str(e)[:200]}")
+                                quota_out = "الحصة اليومية" in str(e)
+                                failed += g
+                        remaining = failed
+                    elif kind == "hf":
+                        failed = []
+                        for s in remaining:
+                            try:
+                                stt.write(f"Chatterbox: المشهد {s['scene_number']}")
+                                p, used = E.tts_hf([x.strip() for x in ss.cfg_tts_spaces.splitlines() if x.strip()],
+                                                   s["dialogue"].strip(), ss.cfg_language, ADIR,
+                                                   key("hf") or None, log=stt.write)
+                                set_voice(s, p, "chatterbox")
+                            except Exception as e:
+                                stt.write(f"⚠️ {str(e)[:160]}")
+                                failed.append(s)
+                        remaining = failed
+                    if remaining:
+                        stt.write(f"Edge TTS للمشاهد المتبقية ({len(remaining)})…")
+                    for s in remaining:
                         try:
-                            if eng == "edge":
-                                fem, mal = E.EDGE_VOICES[ss.cfg_language]
-                                E.tts_edge(txt, fem if ss.cfg_gender == "أنثى" else mal, ss.cfg_voice_rate, out)
-                            else:
-                                if not key("gemini"):
-                                    raise RuntimeError("لا يوجد مفتاح Gemini")
-                                models = [ss.cfg_tts_model] + [m for m in E.GEMINI_TTS_MODELS if m != ss.cfg_tts_model]
-                                E.tts_gemini(key("gemini"), models, txt, ss.cfg_gemini_voice, ss.cfg_language, out, log)
-                            a = A(n)
-                            a["audio_path"] = out
-                            a["audio_dur"] = E.media_duration(out)
-                            a["audio_engine"] = eng
-                            return
+                            edge_one(s)
                         except Exception as e:
-                            err.append(f"{eng}: {str(e)[:140]}")
-                            log(f"⚠️ {err[-1]}")
-                    raise RuntimeError(" | ".join(err))
+                            errors.append(f"المشهد {s['scene_number']}: {str(e)[:120]}")
+                    return errors
 
                 if run_all or redo_all:
                     todo = [s for s in scenes() if redo_all or not A(s["scene_number"]).get("audio_path")]
                     with st.status("جاري توليد الأصوات…", expanded=True) as stt:
-                        prog = st.progress(0.0)
-                        failed = 0
-                        for i, s in enumerate(todo):
-                            stt.write(f"المشهد {s['scene_number']}")
-                            try:
-                                make_voice(s, stt)
-                            except Exception as e:
-                                failed += 1
-                                stt.write(f"❌ المشهد {s['scene_number']}: {e}")
-                            prog.progress((i + 1) / len(todo))
-                        stt.update(label="تم" if not failed else f"انتهى مع {failed} أخطاء",
-                                   state="complete" if not failed else "error")
+                        errs = gen_voices(todo, stt)
+                        for e in errs:
+                            stt.write(f"❌ {e}")
+                        stt.update(label="تم" if not errs else f"انتهى مع {len(errs)} أخطاء",
+                                   state="complete" if not errs else "error")
                 for s in scenes():
                     n = s["scene_number"]
                     a = A(n)
@@ -498,12 +647,12 @@ with main:
                         c1, c2 = st.columns([3, 1])
                         c1.markdown(f"<span class='scene-n'>{n}</span> {s['dialogue']}", unsafe_allow_html=True)
                         if c2.button("↻ إعادة", key=f"re_{n}"):
-                            try:
-                                with st.spinner("…"):
-                                    make_voice(s)
+                            with st.status("…", expanded=True) as stt:
+                                errs = gen_voices([s], stt)
+                                for e in errs:
+                                    st.error(e)
+                            if not errs:
                                 st.rerun()
-                            except Exception as e:
-                                st.error(str(e))
                         if a.get("audio_path") and os.path.exists(a["audio_path"]):
                             st.audio(a["audio_path"])
                             st.caption(f"{a['audio_dur']:.1f} ث · {a.get('audio_engine', '')}")
@@ -602,32 +751,71 @@ with main:
     # 4) الموسيقى
     # ========================================================
     elif ss.step == 4:
-        head("الموسيقى الخلفية", "توليد موسيقى بالذكاء الاصطناعي مجاناً، أو ارفع ملفك.")
+        head("الموسيقى الخلفية", "موسيقى بلا حقوق وآمنة للاستعمال التجاري: بالذكاء الاصطناعي، أو من مكتبة CC0، أو ملفك.")
+        notes = {
+            M_AUTO: "كيجرب ACE-Step، وإلا فمكتبة CC0، وإلا التوليد المحلي. ديما كتخرج موسيقى.",
+            M_ACE: "ACE-Step 1.5 (رخصة MIT): مجاني، يسمح باستعمال الموسيقى المولّدة تجارياً. يحتاج مفتاح مجاني من acemusic.ai.",
+            M_LIB: "Freesound (CC0) و Openverse (CC0 / Public Domain): بلا إسناد ولا حقوق، آمنة للنشر والاستعمال التجاري.",
+            M_HF: "Spaces على Hugging Face (غير مضمونة، تتغير بزاف). تأكد من رخصة الموديل قبل الاستعمال التجاري.",
+            M_LOCAL: "توليد محلي بسيط (بدون إنترنت). حقوقو ديالك 100%.",
+            M_UP: "ارفع موسيقى تملك حقوقها أو بلا حقوق (مثل Pixabay Music أو YouTube Audio Library).",
+            M_NONE: "الفيديو غادي يخرج بدون موسيقى.",
+        }
         with st.container(border=True):
-            ss.music_mode = st.radio("المصدر", MUSIC_MODES, index=MUSIC_MODES.index(ss.music_mode)
-                                     if ss.music_mode in MUSIC_MODES else 0)
-            gen_mode = ss.music_mode not in MUSIC_MODES[4:]
-            if gen_mode:
-                ss.music_prompt = st.text_area("وصف الموسيقى (EN أحسن)", ss.music_prompt, height=100,
-                                               placeholder="calm lo-fi beat, soft piano, 80 BPM, warm and nostalgic")
-                dur = min(120, max(30, target() + 5))
-                if st.button("✨ توليد الموسيقى", type="primary", width="stretch"):
+            ss.music_mode = st.radio("المصدر", MUSIC_MODES, index=MUSIC_MODES.index(ss.music_mode))
+            m = ss.music_mode
+            st.caption(notes[m])
+            if m == M_UP:
+                up = st.file_uploader("ملف الموسيقى (MP3 / WAV)", type=["mp3", "wav", "m4a"])
+                if up:
+                    p = os.path.join(ADIR, "music_upload" + os.path.splitext(up.name)[1])
+                    with open(p, "wb") as f:
+                        f.write(up.getbuffer())
+                    ss.music_path, ss.music_info = p, "ملف مرفوع"
+            elif m == M_NONE:
+                ss.music_path, ss.music_info = None, ""
+            else:
+                if m in (M_AUTO, M_ACE, M_HF, M_LOCAL):
+                    ss.music_prompt = st.text_area("وصف الموسيقى (EN أحسن)", ss.music_prompt, height=100,
+                                                   placeholder="calm lo-fi beat, soft piano, 80 BPM, warm and nostalgic")
+                if m in (M_AUTO, M_LIB):
+                    if not ss.music_query:
+                        ss.music_query = E.suggest_music_query(ss.music_prompt)
+                    ss.music_query = st.text_input("كلمات البحث في المكتبة (EN)", ss.music_query)
+                go_music = st.button("🔎 البحث في المكتبة" if m == M_LIB else "✨ توليد الموسيقى", type="primary",
+                                     width="stretch")
+                if go_music:
                     prompt = ss.music_prompt.strip() or "calm cinematic instrumental background music"
-                    mode = ss.music_mode
-                    order = (["ace", "hf", "local"] if mode.startswith("تلقائي") else
-                             ["ace"] if mode.startswith("ACE") else
-                             ["hf"] if mode.startswith("Hugging") else ["local"])
+                    dur = min(120, max(30, target() + 5))
+                    order = {M_AUTO: ["ace", "lib", "local"], M_ACE: ["ace"], M_LIB: ["lib_list"],
+                             M_HF: ["hf"], M_LOCAL: ["local"]}[m]
                     result = None
-                    with st.status("جاري توليد الموسيقى… (قد يأخذ دقيقة)", expanded=True) as stt:
+                    with st.status("جاري التحضير…", expanded=True) as stt:
                         for src in order:
                             try:
                                 if src == "ace":
-                                    stt.write("ACE Music (سحابي)…")
+                                    stt.write("ACE-Step (سحابي)… قد ياخد دقيقة")
                                     data, ext = E.ace_music(prompt, dur, key("ace"))
                                     p = os.path.join(ADIR, f"music_{int(time.time())}.{ext}")
                                     with open(p, "wb") as f:
                                         f.write(data)
-                                    result = (p, "ACE Music")
+                                    result = (p, "ACE-Step (MIT)")
+                                elif src in ("lib", "lib_list"):
+                                    stt.write("البحث في مكتبة CC0…")
+                                    res, errs = E.search_music_library(ss.music_query, key("freesound"))
+                                    ss.music_results = res
+                                    for er in errs:
+                                        stt.write(f"⚠️ {er}")
+                                    if src == "lib":
+                                        pick = next((r for r in res if r["duration"] >= 20), None)
+                                        if not pick:
+                                            raise RuntimeError("ما لقينا مسارات")
+                                        p = E.download_file(pick["url"], os.path.join(ADIR, f"music_lib_{int(time.time())}.mp3"))
+                                        result = (p, f"{pick['source']} · {pick['license']} · {pick['creator']}")
+                                    else:
+                                        if not res:
+                                            raise RuntimeError("ما لقينا مسارات، جرّب كلمات أخرى")
+                                        result = "listed"
                                 elif src == "hf":
                                     p, used = E.hf_audio(music_spaces(), prompt, 30, ADIR, key("hf") or None, log=stt.write)
                                     result = (p, "Hugging Face · " + used)
@@ -635,26 +823,36 @@ with main:
                                     stt.write("توليد محلي…")
                                     p = os.path.join(ADIR, f"music_{int(time.time())}.wav")
                                     E.write_wav(p, E.synth_music(prompt, 45, ss.cfg_tone))
-                                    result = (p, "توليد محلي (احتياطي)")
+                                    result = (p, "توليد محلي")
                                 break
                             except Exception as e:
-                                stt.write(f"⚠️ {src}: {str(e)[:220]}")
-                        if result:
+                                stt.write(f"⚠️ {src}: {str(e)[:240]}")
+                        if result == "listed":
+                            stt.update(label="اختر مساراً من النتائج تحت", state="complete")
+                        elif result:
                             ss.music_path, ss.music_info = result
                             stt.update(label=f"جاهزة · {result[1]}", state="complete")
                         else:
-                            stt.update(label="فشل التوليد", state="error")
-            elif ss.music_mode == "رفع ملف موسيقى":
-                up = st.file_uploader("ملف الموسيقى (MP3 / WAV)", type=["mp3", "wav", "m4a"])
-                if up:
-                    p = os.path.join(ADIR, "music_upload" + os.path.splitext(up.name)[1])
-                    with open(p, "wb") as f:
-                        f.write(up.getbuffer())
-                    ss.music_path, ss.music_info = p, "ملف مرفوع"
-            else:
-                ss.music_path, ss.music_info = None, ""
-                st.info("الفيديو غادي يخرج بدون موسيقى.")
+                            stt.update(label="فشل التوليد، جرّب مصدراً آخر أو افحص الخدمات من الشريط الجانبي", state="error")
+        if ss.music_results and ss.music_mode in (M_AUTO, M_LIB):
+            st.markdown("##### 🎼 نتائج المكتبة (CC0 / Public Domain)")
+            for i, r in enumerate(ss.music_results[:8]):
+                with st.container(border=True):
+                    c1, c2 = st.columns([3, 1])
+                    c1.markdown(f"**{r['title'] or '—'}**  \n<small>{r['source']} · {r['license']} · {r['creator']} · "
+                                f"{r['duration']:.0f} ث</small>", unsafe_allow_html=True)
+                    if c2.button("استعمال", key=f"use_{i}", width="stretch"):
+                        try:
+                            ext = r["url"].split("?")[0].rsplit(".", 1)[-1].lower()
+                            ext = ext if ext in ("mp3", "wav", "ogg", "flac", "m4a") else "mp3"
+                            p = E.download_file(r["url"], os.path.join(ADIR, f"music_lib_{i}.{ext}"))
+                            ss.music_path, ss.music_info = p, f"{r['source']} · {r['license']} · {r['creator']}"
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"تعذر التحميل: {e}")
+                    st.audio(r["url"])
         if ss.music_path and os.path.exists(ss.music_path):
+            st.success("🎵 الموسيقى المختارة")
             st.audio(ss.music_path)
             st.caption(f"{ss.music_info} · {E.media_duration(ss.music_path):.0f} ث (كتتكرر تلقائياً إلى نهاية الفيديو)")
         nav(prev=3, nxt=5, nxt_label="المونتاج")
@@ -663,127 +861,134 @@ with main:
     # 5) المونتاج
     # ========================================================
     else:
-        head("المونتاج النهائي", "اختر مقطع الفيديو المناسب لكل مشهد، ثم ابدأ التركيب.")
+        head("المونتاج النهائي", "ابدأ التركيب، والفيديو كيبان هنا (فوق) مع زر التحميل. بعدها تقدر تبدّل المقاطع.")
         if not ss.project:
             st.info("ابدأ من الخطوة 1.")
             nav(prev=4)
         else:
             orient = {"9:16": "portrait", "4:5": "portrait", "16:9": "landscape", "4:3": "landscape", "1:1": "square"}[
                 ss.cfg_aspect.split(" ")[0]]
-            if not (key("pexels") or key("pixabay")):
+            has_stock_key = bool(key("pexels") or key("pixabay"))
+            if not has_stock_key:
                 st.warning("ما كاين حتى مفتاح للفيديو. دخل Pexels أو Pixabay (مجانيين) وإلا غادي تكون الخلفيات متدرجة.")
 
-            def search_scene(s, q=None):
-                a = A(s["scene_number"])
-                res, errs = E.find_clips(q or s["search_keyword"], orient, key("pexels"), key("pixabay"), 6)
-                a["stock"] = res
-                a["clip_idx"] = 0 if res else -1
-                a["clip_path"] = None
-                return errs
+            def thumbs_for(scs):
+                tasks = [o for s in scs for o in A(s["scene_number"]).get("stock", [])[:4]]
+
+                def work(o):
+                    if o["source"] == "Pexels" and o.get("thumb"):
+                        return
+                    try:
+                        src = o.get("preview") or o["url"]
+                        dest = os.path.join(VDIR, "th_" + hashlib.md5(src.encode()).hexdigest()[:12] + ".jpg")
+                        o["thumb"] = E.make_thumb(src, dest)
+                    except Exception:
+                        pass
+
+                with ThreadPoolExecutor(6) as ex:
+                    list(ex.map(work, tasks))
+
+            def fetch_stock(scs, q_override=None):
+                msgs = []
+                for s in scs:
+                    a = A(s["scene_number"])
+                    res, errs = E.find_clips(q_override or s["search_keyword"], orient, key("pexels"), key("pixabay"), 6)
+                    a["stock"], a["clip_idx"], a["clip_path"] = res, (0 if res else -1), None
+                    msgs += errs
+                thumbs_for(scs)
+                return msgs
 
             need = [s for s in scenes() if "stock" not in A(s["scene_number"])]
-            c1, c2 = st.columns([2, 1])
-            if need and (key("pexels") or key("pixabay")):
+            if need and has_stock_key:
                 with st.status("جاري البحث عن المقاطع…", expanded=False) as stt:
-                    for s in need:
-                        for er in search_scene(s):
-                            stt.write(er)
+                    for er in fetch_stock(need):
+                        stt.write(er)
                     stt.update(label="المقاطع جاهزة", state="complete")
-            if c2.button("↻ إعادة البحث لكل المشاهد", width="stretch"):
-                with st.spinner("…"):
-                    for s in scenes():
-                        search_scene(s)
-                st.rerun()
 
+            # ---------- بطاقة التصدير (فوق) ----------
+            tl = timeline()
+            with st.container(border=True):
+                st.markdown(f"**الملخص:** {len(scenes())} مشهد · مدة الفيديو **{tl['total']:.0f} ث** · "
+                            f"{ss.cfg_quality} · {ss.cfg_aspect.split(' ')[0]} · {'مع موسيقى' if ss.music_path else 'بدون موسيقى'}")
+                if tl["speed"] > 1.001:
+                    st.caption(f"سيتم تسريع التعليق الصوتي بنسبة {tl['speed']:.2f}× ليناسب المدة المطلوبة.")
+                if tl["overflow"]:
+                    st.warning(f"الحوار يحتاج {tl['total']:.0f} ث وهو أطول من {target()} ث. قصّر النصوص أو زد المدة.")
+                if ss.cfg_quality == "1080p" and tl["total"] > 60:
+                    st.warning("1080p لفيديو طويل ثقيل على السيرفر المجاني وقد يتوقف. الأضمن 720p.")
+                busy = read_status().get("state") == "running" and render_alive()
+                render = st.button("🎬 بدء التركيب النهائي", type="primary", width="stretch", disabled=busy)
+                if render:
+                    voice_missing = [s["scene_number"] for s in scenes() if ss.voice_mode == "per_scene"
+                                     and not A(s["scene_number"]).get("audio_path") and s["dialogue"].strip()]
+                    if ss.voice_mode == "master" and not master_dur():
+                        st.error("ما رفعتيش الملف الصوتي (الخطوة 2).")
+                    elif voice_missing:
+                        st.error(f"ما كاينش تعليق صوتي للمشاهد: {voice_missing}. ولّده من الخطوة 2.")
+                    else:
+                        W, H = size()
+                        cfg = dict(W=W, H=H, fps=int(ss.cfg_fps), captions=ss.cfg_captions, cap_size=int(ss.cfg_cap_size),
+                                   cap_color=ss.cfg_cap_color, cap_pos=ss.cfg_cap_pos, watermark=ss.cfg_watermark.strip(),
+                                   vol_voice=ss.cfg_vol_voice / 100, vol_sfx=ss.cfg_vol_sfx / 100,
+                                   vol_music=ss.cfg_vol_music / 100, duck=ss.cfg_duck)
+                        assets_c = copy.deepcopy(ss.assets)
+                        jobs = {}
+                        for s in scenes():
+                            sn = str(s["scene_number"])
+                            a = assets_c.setdefault(sn, {})
+                            a["sfx"] = copy.deepcopy(s["sfx"])
+                            idx, opts = a.get("clip_idx", -1), a.get("stock", [])
+                            a["clip_path"] = None
+                            if idx is not None and 0 <= idx < len(opts):
+                                jobs[sn] = opts[idx]["url"]
+                        out = os.path.join(PDIR, f"final_{int(time.time())}.mp4")
+                        write_status({"state": "running", "progress": 0.0, "msg": "بدء التحضير…"})
+                        threading.Thread(
+                            target=_render_worker, name=f"render-{pid}", daemon=True,
+                            args=(copy.deepcopy(ss.project), assets_c, cfg, tl, ss.music_path, out, WDIR, FONT_DIR,
+                                  ss.master_audio_path if tl["master"] else None, jobs, VDIR, STATUS_FILE)).start()
+                        st.rerun()
+                running = read_status().get("state") == "running" and render_alive()
+                st.fragment(render_panel, run_every=2 if running else None)()
+
+            # ---------- المقاطع ----------
+            hc1, hc2 = st.columns([3, 1])
+            hc1.markdown("#### 🎞️ مقاطع الفيديو لكل مشهد")
+            if hc2.button("↻ إعادة البحث للكل", width="stretch", disabled=not has_stock_key):
+                with st.spinner("…"):
+                    fetch_stock(scenes())
+                st.rerun()
             for s in scenes():
                 n = s["scene_number"]
                 a = A(n)
-                opts = a.get("stock", [])
+                opts = a.get("stock", [])[:4]
                 with st.container(border=True):
                     h = st.columns([4, 2])
                     h[0].markdown(f"<span class='scene-n'>{n}</span> **{s['search_keyword']}** "
                                   f"<span class='pill'>{s['duration']:.0f} ث</span>", unsafe_allow_html=True)
                     q = h[1].text_input("بحث", "", key=f"q_{n}", placeholder="كلمة أخرى…", label_visibility="collapsed")
-                    if q and q != a.get("last_q"):
+                    if q and q != a.get("last_q") and has_stock_key:
                         a["last_q"] = q
-                        search_scene(s, q)
-                        opts = a.get("stock", [])
+                        fetch_stock([s], q)
+                        opts = a.get("stock", [])[:4]
                     if opts:
-                        cols = st.columns(min(4, len(opts)))
-                        for i, o in enumerate(opts[:4]):
+                        cols = st.columns(len(opts))
+                        for i, o in enumerate(opts):
                             if o.get("thumb"):
                                 cols[i].image(o["thumb"], width="stretch")
+                            else:
+                                cols[i].caption("🎞️ بلا صورة")
                             cols[i].caption(f"{i + 1} · {o['source']}" + (f" · {o['duration']}s" if o.get("duration") else ""))
-                        labels = ["بدون فيديو"] + [f"{i + 1}" for i in range(min(4, len(opts)))]
+                        labels = ["بدون فيديو"] + [str(i + 1) for i in range(len(opts))]
                         cur = a.get("clip_idx", 0)
-                        sel = st.radio("المقطع", labels, index=(cur + 1) if 0 <= cur < len(labels) - 1 else 0,
+                        sel = st.radio("المقطع", labels, index=(cur + 1) if 0 <= cur < len(opts) else 0,
                                        horizontal=True, key=f"sel_{n}", label_visibility="collapsed")
                         a["clip_idx"] = -1 if sel == "بدون فيديو" else int(sel) - 1
+                        if a["clip_idx"] >= 0 and st.toggle("▶ معاينة المقطع", key=f"pv_{n}"):
+                            st.video(opts[a["clip_idx"]].get("preview") or opts[a["clip_idx"]]["url"])
                     else:
                         st.caption("ما لقيناش مقطع. غادي نستعملو خلفية متدرجة (جرّب كلمة بحث أخرى).")
                         a["clip_idx"] = -1
-
-            st.divider()
-            tl = timeline()
-            st.markdown(f"**الملخص:** {len(scenes())} مشهد · مدة الفيديو **{tl['total']:.0f} ث** · "
-                        f"{ss.cfg_quality} · {ss.cfg_aspect.split(' ')[0]} · {'مع موسيقى' if ss.music_path else 'بدون موسيقى'}")
-            if tl["speed"] > 1.001:
-                st.caption(f"سيتم تسريع التعليق الصوتي بنسبة {tl['speed']:.2f}× ليناسب المدة المطلوبة.")
-            if tl["overflow"]:
-                st.warning(f"الحوار يحتاج {tl['total']:.0f} ث وهو أطول من {target()} ث. قصّر النصوص أو زد المدة.")
-            render = st.button("🎬 بدء التركيب النهائي", type="primary", width="stretch")
-
-            if render:
-                voice_missing = [s["scene_number"] for s in scenes() if ss.voice_mode == "per_scene"
-                                 and not A(s["scene_number"]).get("audio_path") and s["dialogue"].strip()]
-                if ss.voice_mode == "master" and not master_dur():
-                    st.error("ما رفعتيش الملف الصوتي (الخطوة 2).")
-                elif voice_missing:
-                    st.error(f"ما كاينش تعليق صوتي للمشاهد: {voice_missing}. ولّده من الخطوة 2.")
-                else:
-                    W, H = size()
-                    cfg = dict(W=W, H=H, fps=int(ss.cfg_fps), captions=ss.cfg_captions, cap_size=int(ss.cfg_cap_size),
-                               cap_color=ss.cfg_cap_color, cap_pos=ss.cfg_cap_pos, watermark=ss.cfg_watermark.strip(),
-                               vol_voice=ss.cfg_vol_voice / 100, vol_sfx=ss.cfg_vol_sfx / 100,
-                               vol_music=ss.cfg_vol_music / 100, duck=ss.cfg_duck)
-                    bar = st.progress(0.0, text="…")
-                    try:
-                        with st.spinner("جاري التركيب… هادشي كياخد وقت حسب الطول والجودة"):
-                            for s in scenes():
-                                a = A(s["scene_number"])
-                                idx = a.get("clip_idx", -1)
-                                opts = a.get("stock", [])
-                                a["clip_path"] = None
-                                a["sfx"] = s["sfx"]
-                                if idx is not None and 0 <= idx < len(opts):
-                                    try:
-                                        dest = os.path.join(VDIR, hashlib.md5(opts[idx]["url"].encode()).hexdigest()[:12] + ".mp4")
-                                        a["clip_path"] = E.download_file(opts[idx]["url"], dest)
-                                    except Exception as e:
-                                        st.warning(f"تعذر تحميل مقطع المشهد {s['scene_number']}: {str(e)[:100]}")
-                            shutil.rmtree(WDIR, ignore_errors=True)
-                            os.makedirs(WDIR, exist_ok=True)
-                            out = os.path.join(PDIR, f"final_{int(time.time())}.mp4")
-                            E.render_project(ss.project, ss.assets, cfg, tl, ss.music_path, out, WDIR, FONT_DIR,
-                                             master_audio_path=ss.master_audio_path if tl["master"] else None,
-                                             progress=lambda f, m: bar.progress(min(1.0, f), text=m))
-                        for old in os.listdir(PDIR):
-                            if old.startswith("final_") and os.path.join(PDIR, old) != out:
-                                try:
-                                    os.remove(os.path.join(PDIR, old))
-                                except Exception:
-                                    pass
-                        ss.final_path = out
-                        st.toast("الفيديو جاهز", icon="🎉")
-                    except Exception as e:
-                        st.error(f"وقع مشكل أثناء التركيب: {e}")
-
-            if ss.final_path and os.path.exists(ss.final_path):
-                st.success(f"✅ الفيديو النهائي جاهز · {E.media_duration(ss.final_path):.0f} ثانية")
-                st.video(ss.final_path)
-                with open(ss.final_path, "rb") as f:
-                    st.download_button("⬇️ تحميل الفيديو (MP4)", f, file_name="ai_studio_video.mp4",
-                                       mime="video/mp4", width="stretch")
             nav(prev=4)
 
 save_state()
