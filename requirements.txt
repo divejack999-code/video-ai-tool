@@ -1,0 +1,11 @@
+streamlit>=1.50
+moviepy>=2.1
+pillow
+numpy
+requests
+google-genai
+gradio_client
+edge-tts
+arabic-reshaper
+python-bidi
+imageio-ffmpeg
