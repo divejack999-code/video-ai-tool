@@ -52,7 +52,7 @@ CFG = {
 }
 STATE_KEYS = list(CFG) + ["project", "assets", "step", "gen_id", "last_custom_script", "topic",
                           "music_prompt", "music_path", "music_info", "voice_mode", "master_audio_path",
-                          "sfx_mode", "music_mode", "final_path", "music_query", "music_results"]
+                          "sfx_mode", "music_mode", "final_path", "music_query", "music_results", "master_bounds", "master_sig", "shots_ver"]
 
 ss = st.session_state
 
@@ -139,6 +139,9 @@ if "_loaded" not in ss:
             ss[_k] = CFG.get(_k, _opts[0])
     ss.setdefault("music_query", "")
     ss.setdefault("music_results", [])
+    ss.setdefault("master_bounds", None)
+    ss.setdefault("master_sig", "")
+    ss.setdefault("shots_ver", 0)
     cleanup_old_projects()
     ss["_loaded"] = True
 
@@ -329,7 +332,54 @@ def master_dur():
 
 
 def timeline():
-    return E.build_timeline(scenes(), ss.assets, target(), master_dur())
+    return E.build_timeline(scenes(), ss.assets, target(), master_dur(), ss.get("master_bounds"))
+
+
+def shot_asset(sn, k):
+    lst = A(sn).setdefault("shots", [])
+    while len(lst) <= k:
+        lst.append({})
+    return lst[k]
+
+
+def ensure_shots():
+    """يقسّم حوار كل مشهد إلى لقطات (جملة = لقطة). يعيد القسمة فقط إذا تغيّر الحوار."""
+    for s in scenes():
+        sig = E.shots_sig(s["dialogue"])
+        if s.get("shots") and s.get("shots_sig") == sig:
+            continue
+        texts = E.make_shots(s["dialogue"])
+        s["shots"] = [{"text": t, "keyword": s["search_keyword"], "alt": [], "visual": ""} for t in texts]
+        s["shots_sig"] = sig
+        A(s["scene_number"])["shots"] = [{} for _ in texts]
+
+
+def ensure_bounds():
+    """يحسب توقيت نهاية كل جملة داخل الصوت (مخزّن حتى لا يُعاد الحساب)."""
+    if ss.voice_mode == "per_scene":
+        for s in scenes():
+            a = A(s["scene_number"])
+            p = a.get("audio_path")
+            texts = [x["text"] for x in s.get("shots", [])]
+            if not p or not os.path.exists(p) or not texts:
+                a["bounds"] = None
+                continue
+            sig = hashlib.md5((p + "|" + "|".join(texts)).encode("utf-8")).hexdigest()
+            if a.get("bounds_sig") != sig:
+                try:
+                    a["bounds"] = E.sentence_bounds(p, texts)
+                except Exception:
+                    a["bounds"] = None
+                a["bounds_sig"] = sig
+    elif master_dur():
+        texts = [x["text"] for s in scenes() for x in s.get("shots", [])]
+        sig = hashlib.md5((ss.master_audio_path + "|" + "|".join(texts)).encode("utf-8")).hexdigest()
+        if texts and ss.get("master_sig") != sig:
+            try:
+                ss.master_bounds = E.sentence_bounds(ss.master_audio_path, texts)
+            except Exception:
+                ss.master_bounds = None
+            ss.master_sig = sig
 
 
 # ============================================================
@@ -368,13 +418,17 @@ def _render_worker(project, assets, cfg, tl, music_path, out, work_dir, font_dir
 
     try:
         n = max(1, len(clip_jobs))
-        for i, (sn, url) in enumerate(clip_jobs.items()):
+        for i, (kk, url) in enumerate(clip_jobs.items()):
             put("running", progress=0.05 * i / n, msg=f"تحميل مقاطع الفيديو {i + 1}/{n}")
+            sn, k = kk.split(":")
+            lst = assets.setdefault(sn, {}).setdefault("shots", [])
+            while len(lst) <= int(k):
+                lst.append({})
             try:
                 dest = os.path.join(vdir, hashlib.md5(url.encode()).hexdigest()[:12] + ".mp4")
-                assets.setdefault(sn, {})["clip_path"] = E.download_file(url, dest)
+                lst[int(k)]["clip_path"] = E.download_file(url, dest)
             except Exception:
-                assets.setdefault(sn, {})["clip_path"] = None
+                lst[int(k)]["clip_path"] = None
         shutil.rmtree(work_dir, ignore_errors=True)
         os.makedirs(work_dir, exist_ok=True)
         E.render_project(project, assets, cfg, tl, music_path, out, work_dir, font_dir, master_audio_path=master_audio,
@@ -443,7 +497,9 @@ with side:
             tl = timeline()
             ok_v = sum(1 for s in sc if A(s["scene_number"]).get("audio_path")) if ss.voice_mode == "per_scene" else (len(sc) if master_dur() else 0)
             ok_s = sum(1 for s in sc if any(e.get("path") for e in A(s["scene_number"]).get("sfx", [])))
-            ok_c = sum(1 for s in sc if A(s["scene_number"]).get("clip_path") or A(s["scene_number"]).get("clip_idx", -1) >= 0)
+            ok_c = sum(1 for s in sc for k in range(len(E.get_shots(s))) if (A(s["scene_number"]).get("shots") or [{}] * (k + 1))[k].get("clip_idx", -1) >= 0) \
+                if any(s.get("shots") for s in sc) else 0
+            n_sh = sum(len(E.get_shots(s)) for s in sc)
             segs = "".join(
                 f"<i style='flex:{max(it['dur'], 0.5):.2f}' title='المشهد {it['n']} · {it['dur']:.1f}s'>{it['n']}</i>"
                 for it in tl["items"])
@@ -455,7 +511,7 @@ with side:
             <div class="sum-row"><span>التعليق الصوتي</span><b class="{'ok' if ok_v == len(sc) else 'no'}">{ok_v}/{len(sc)}</b></div>
             <div class="sum-row"><span>المؤثرات</span><b class="{'ok' if ok_s else 'no'}">{ok_s}/{len(sc)}</b></div>
             <div class="sum-row"><span>الموسيقى</span><b class="{'ok' if ss.music_path else 'no'}">{'✓' if ss.music_path else '—'}</b></div>
-            <div class="sum-row"><span>مقاطع الفيديو</span><b class="{'ok' if ok_c == len(sc) else 'no'}">{ok_c}/{len(sc)}</b></div>
+            <div class="sum-row"><span>لقطات الفيديو</span><b class="{'ok' if n_sh and ok_c == n_sh else 'no'}">{ok_c}/{n_sh}</b></div>
             </div>""", unsafe_allow_html=True)
             if tl["overflow"]:
                 st.warning("الحوار أطول من المدة المطلوبة، قصّر النصوص أو زد المدة.")
@@ -497,6 +553,7 @@ with main:
                         ss.gen_id += 1
                         ss.music_prompt = ss.project["music_prompt"]
                         ss.music_query, ss.music_results = "", []
+                        ss.shots_ver += 1
                         ss.music_path = None
                         ss.master_audio_path = None
                         ss.final_path = None
@@ -861,7 +918,7 @@ with main:
     # 5) المونتاج
     # ========================================================
     else:
-        head("المونتاج النهائي", "ابدأ التركيب، والفيديو كيبان هنا (فوق) مع زر التحميل. بعدها تقدر تبدّل المقاطع.")
+        head("المونتاج النهائي", "المخرج الذكي كيحلل كل جملة، كيختار ليها مقطع مناسب، وكيقصّو على توقيت الجملة بالضبط.")
         if not ss.project:
             st.info("ابدأ من الخطوة 1.")
             nav(prev=4)
@@ -871,9 +928,12 @@ with main:
             has_stock_key = bool(key("pexels") or key("pixabay"))
             if not has_stock_key:
                 st.warning("ما كاين حتى مفتاح للفيديو. دخل Pexels أو Pixabay (مجانيين) وإلا غادي تكون الخلفيات متدرجة.")
+            ensure_shots()
+            ensure_bounds()
+            models_g = [ss.cfg_script_model] + [m for m in E.GEMINI_SCRIPT_FALLBACKS if m != ss.cfg_script_model]
 
-            def thumbs_for(scs):
-                tasks = [o for s in scs for o in A(s["scene_number"]).get("stock", [])[:4]]
+            def thumbs_for(targets):
+                opts_all = [o for (s, k) in targets for o in shot_asset(s["scene_number"], k).get("stock", [])[:4]]
 
                 def work(o):
                     if o["source"] == "Pexels" and o.get("thumb"):
@@ -886,29 +946,92 @@ with main:
                         pass
 
                 with ThreadPoolExecutor(6) as ex:
-                    list(ex.map(work, tasks))
+                    list(ex.map(work, opts_all))
 
-            def fetch_stock(scs, q_override=None):
-                msgs = []
-                for s in scs:
-                    a = A(s["scene_number"])
-                    res, errs = E.find_clips(q_override or s["search_keyword"], orient, key("pexels"), key("pixabay"), 6)
-                    a["stock"], a["clip_idx"], a["clip_path"] = res, (0 if res else -1), None
-                    msgs += errs
-                thumbs_for(scs)
-                return msgs
+            def search_shots(targets):
+                pk, xk = key("pexels"), key("pixabay")  # خارج الـ threads
 
-            need = [s for s in scenes() if "stock" not in A(s["scene_number"])]
-            if need and has_stock_key:
-                with st.status("جاري البحث عن المقاطع…", expanded=False) as stt:
-                    for er in fetch_stock(need):
-                        stt.write(er)
-                    stt.update(label="المقاطع جاهزة", state="complete")
+                def work(t):
+                    s, k = t
+                    sh = s["shots"][k]
+                    return E.find_clips(sh["keyword"], orient, pk, xk, 6, sh.get("alt"))
 
-            # ---------- بطاقة التصدير (فوق) ----------
-            tl = timeline()
+                with ThreadPoolExecutor(4) as ex:
+                    results = list(ex.map(work, targets))
+                errs = []
+                for (s, k), (res, er) in zip(targets, results):
+                    sa = shot_asset(s["scene_number"], k)
+                    sa["stock"], sa["clip_idx"], sa["clip_path"], sa["note"] = res, (0 if res else -1), None, ""
+                    errs += er
+                thumbs_for(targets)
+                return errs
+
+            def run_director(use_vision):
+                gk = key("gemini")
+                all_t = [(s, k) for s in scenes() for k in range(len(s["shots"]))]
+                with st.status("المخرج الذكي كيخدم…", expanded=True) as stt:
+                    stt.write("1) تحليل معنى كل جملة وكتابة وصف اللقطة…")
+                    try:
+                        plan = E.plan_shots(gk, models_g, ss.project, ss.cfg_language, ss.cfg_tone, log=stt.write)
+                        for s in scenes():
+                            for k, sh in enumerate(s["shots"]):
+                                p = plan.get((s["scene_number"], k))
+                                if p and p["keyword"]:
+                                    sh["keyword"], sh["alt"], sh["visual"] = p["keyword"], p["alt"], p["visual"]
+                        stt.write(f"   ✓ {len(plan)} لقطة محلّلة")
+                    except Exception as e:
+                        stt.write(f"⚠️ فشل التحليل ({str(e)[:160]}). كنستعمل الكلمات الحالية.")
+                    ss.shots_ver += 1
+                    stt.write("2) البحث عن مقاطع لكل لقطة…")
+                    for er in search_shots(all_t):
+                        stt.write(f"⚠️ {er}")
+                    stt.write("3) اختيار أحسن مقطع لكل جملة" + (" بالرؤية (Gemini يشوف الصور)…" if use_vision else "…"))
+                    used = set()
+                    sc = scenes()
+                    for si, s in enumerate(sc):
+                        n = s["scene_number"]
+                        opts_list = [shot_asset(n, k).get("stock", [])[:4] for k in range(len(s["shots"]))]
+                        rankings, notes = None, [""] * len(opts_list)
+                        if use_vision and any(opts_list):
+                            try:
+                                with ThreadPoolExecutor(6) as ex:
+                                    imgs = [list(ex.map(lambda o: E.get_image_bytes(o.get("thumb"), VDIR), opts)) for opts in opts_list]
+                                items = [{"text": sh["text"], "images": im} for sh, im in zip(s["shots"], imgs)]
+                                res = E.vision_rank(gk, models_g, items, ss.cfg_language, log=stt.write)
+                                rankings, notes = [r["ranking"] for r in res], [r["note"] for r in res]
+                                time.sleep(2.5)
+                            except Exception as e:
+                                stt.write(f"⚠️ المشهد {n}: الرؤية فشلت ({str(e)[:110]})، ترتيب بالنص.")
+                        if rankings is None:
+                            rankings = [E.rank_by_text([sh["keyword"]] + sh.get("alt", []), o)
+                                        for sh, o in zip(s["shots"], opts_list)]
+                        picks = E.pick_unique(rankings, opts_list, used)
+                        for k, p in enumerate(picks):
+                            sa = shot_asset(n, k)
+                            sa["clip_idx"], sa["note"] = p, notes[k]
+                        stt.write(f"   المشهد {n}: {len(picks)} لقطات ✓")
+                    ss.shots_ver += 1
+                    stt.update(label="المخرج الذكي سالا ✅", state="complete")
+
+            # ---------- المخرج الذكي ----------
             with st.container(border=True):
-                st.markdown(f"**الملخص:** {len(scenes())} مشهد · مدة الفيديو **{tl['total']:.0f} ث** · "
+                st.markdown("##### 🤖 المخرج الذكي")
+                st.caption("كل جملة كتاخد مقطعها: Gemini كيفهم معنى الجملة ويكتب وصف اللقطة، وكيشوف الصور ويختار الأنسب، "
+                           "والقص كيتحسب من توقيت الصوت (ماشي من الوسط).")
+                c1, c2 = st.columns([2, 1])
+                use_vision = c2.toggle("اختيار بالرؤية", value=True, key="use_vision",
+                                       help="Gemini كيشوف الصور المصغرة ويختار. كيستهلك طلبات أكثر من الحصة المجانية.")
+                ready = has_stock_key and bool(key("gemini"))
+                if c1.button("🪄 تحليل الجمل واختيار المقاطع", type="primary", width="stretch", disabled=not ready):
+                    run_director(use_vision)
+                if not ready:
+                    st.caption("يحتاج مفتاح Gemini + مفتاح فيديو (Pexels أو Pixabay).")
+
+            # ---------- بطاقة التصدير ----------
+            tl = timeline()
+            n_shots = sum(len(s["shots"]) for s in scenes())
+            with st.container(border=True):
+                st.markdown(f"**الملخص:** {len(scenes())} مشهد · {n_shots} لقطة · مدة الفيديو **{tl['total']:.0f} ث** · "
                             f"{ss.cfg_quality} · {ss.cfg_aspect.split(' ')[0]} · {'مع موسيقى' if ss.music_path else 'بدون موسيقى'}")
                 if tl["speed"] > 1.001:
                     st.caption(f"سيتم تسريع التعليق الصوتي بنسبة {tl['speed']:.2f}× ليناسب المدة المطلوبة.")
@@ -916,6 +1039,28 @@ with main:
                     st.warning(f"الحوار يحتاج {tl['total']:.0f} ث وهو أطول من {target()} ث. قصّر النصوص أو زد المدة.")
                 if ss.cfg_quality == "1080p" and tl["total"] > 60:
                     st.warning("1080p لفيديو طويل ثقيل على السيرفر المجاني وقد يتوقف. الأضمن 720p.")
+                # تقرير الجودة قبل التركيب
+                issues, used_urls = [], {}
+                for s, it in zip(scenes(), tl["items"]):
+                    n = s["scene_number"]
+                    for k, w in enumerate(it["shots"]):
+                        sa = shot_asset(n, k)
+                        opts, idx = sa.get("stock", []), sa.get("clip_idx", -1)
+                        if idx is None or idx < 0 or idx >= len(opts):
+                            issues.append(f"المشهد {n} · اللقطة {k + 1}: بلا مقطع (غادي تكون خلفية متدرجة)")
+                        else:
+                            used_urls.setdefault(opts[idx]["url"], []).append(f"{n}.{k + 1}")
+                        if w["dur"] < 1.2:
+                            issues.append(f"المشهد {n} · اللقطة {k + 1}: قصيرة بزاف ({w['dur']:.1f} ث)")
+                for u, where in used_urls.items():
+                    if len(where) > 1:
+                        issues.append(f"نفس المقطع مستعمل فاللقطات: {', '.join(where)}")
+                if issues:
+                    with st.expander(f"⚠️ تقرير الجودة ({len(issues)} ملاحظة)"):
+                        for i in issues[:40]:
+                            st.markdown(f"- {i}")
+                else:
+                    st.caption("✅ تقرير الجودة: ما كاين حتى مشكل.")
                 busy = read_status().get("state") == "running" and render_alive()
                 render = st.button("🎬 بدء التركيب النهائي", type="primary", width="stretch", disabled=busy)
                 if render:
@@ -937,10 +1082,14 @@ with main:
                             sn = str(s["scene_number"])
                             a = assets_c.setdefault(sn, {})
                             a["sfx"] = copy.deepcopy(s["sfx"])
-                            idx, opts = a.get("clip_idx", -1), a.get("stock", [])
-                            a["clip_path"] = None
-                            if idx is not None and 0 <= idx < len(opts):
-                                jobs[sn] = opts[idx]["url"]
+                            sl = a.setdefault("shots", [])
+                            while len(sl) < len(s["shots"]):
+                                sl.append({})
+                            for k in range(len(s["shots"])):
+                                idx, opts = sl[k].get("clip_idx", -1), sl[k].get("stock", [])
+                                sl[k]["clip_path"] = None
+                                if idx is not None and 0 <= idx < len(opts):
+                                    jobs[f"{sn}:{k}"] = opts[idx]["url"]
                         out = os.path.join(PDIR, f"final_{int(time.time())}.mp4")
                         write_status({"state": "running", "progress": 0.0, "msg": "بدء التحضير…"})
                         threading.Thread(
@@ -951,44 +1100,52 @@ with main:
                 running = read_status().get("state") == "running" and render_alive()
                 st.fragment(render_panel, run_every=2 if running else None)()
 
-            # ---------- المقاطع ----------
+            # ---------- اللقطات ----------
             hc1, hc2 = st.columns([3, 1])
-            hc1.markdown("#### 🎞️ مقاطع الفيديو لكل مشهد")
+            hc1.markdown("#### 🎞️ اللقطات (جملة = مقطع)")
             if hc2.button("↻ إعادة البحث للكل", width="stretch", disabled=not has_stock_key):
                 with st.spinner("…"):
-                    fetch_stock(scenes())
+                    search_shots([(s, k) for s in scenes() for k in range(len(s["shots"]))])
+                    ss.shots_ver += 1
                 st.rerun()
-            for s in scenes():
+            ver = ss.shots_ver
+            for si, (s, it) in enumerate(zip(scenes(), tl["items"])):
                 n = s["scene_number"]
-                a = A(n)
-                opts = a.get("stock", [])[:4]
-                with st.container(border=True):
-                    h = st.columns([4, 2])
-                    h[0].markdown(f"<span class='scene-n'>{n}</span> **{s['search_keyword']}** "
-                                  f"<span class='pill'>{s['duration']:.0f} ث</span>", unsafe_allow_html=True)
-                    q = h[1].text_input("بحث", "", key=f"q_{n}", placeholder="كلمة أخرى…", label_visibility="collapsed")
-                    if q and q != a.get("last_q") and has_stock_key:
-                        a["last_q"] = q
-                        fetch_stock([s], q)
-                        opts = a.get("stock", [])[:4]
-                    if opts:
-                        cols = st.columns(len(opts))
-                        for i, o in enumerate(opts):
-                            if o.get("thumb"):
-                                cols[i].image(o["thumb"], width="stretch")
+                with st.expander(f"المشهد {n} · {len(s['shots'])} لقطات · {s['location'] or ''}", expanded=(si == 0)):
+                    for k, sh in enumerate(s["shots"]):
+                        sa = shot_asset(n, k)
+                        w = it["shots"][k]
+                        opts = sa.get("stock", [])[:4]
+                        with st.container(border=True):
+                            st.markdown(f"<span class='scene-n'>{k + 1}</span> {sh['text']} "
+                                        f"<span class='pill'>{w['dur']:.1f} ث</span>", unsafe_allow_html=True)
+                            new_kw = st.text_input("وصف اللقطة (EN)", sh["keyword"], key=f"kw_{ver}_{n}_{k}")
+                            if new_kw.strip() and new_kw != sh["keyword"] and has_stock_key:
+                                sh["keyword"], sh["alt"] = new_kw.strip(), []
+                                search_shots([(s, k)])
+                                opts = shot_asset(n, k).get("stock", [])[:4]
+                                sa = shot_asset(n, k)
+                            if opts:
+                                cols = st.columns(len(opts))
+                                for i, o in enumerate(opts):
+                                    if o.get("thumb"):
+                                        cols[i].image(o["thumb"], width="stretch")
+                                    else:
+                                        cols[i].caption("🎞️ بلا صورة")
+                                    cols[i].caption(f"{i + 1} · {o['source']}")
+                                labels = ["بدون فيديو"] + [str(i + 1) for i in range(len(opts))]
+                                cur = sa.get("clip_idx", 0)
+                                sel = st.radio("المقطع", labels, index=(cur + 1) if 0 <= cur < len(opts) else 0,
+                                               horizontal=True, key=f"sel_{ver}_{n}_{k}", label_visibility="collapsed")
+                                sa["clip_idx"] = -1 if sel == "بدون فيديو" else int(sel) - 1
+                                if sa.get("note"):
+                                    st.caption(f"🤖 {sa['note']}")
+                                if sa["clip_idx"] >= 0 and st.toggle("▶ معاينة المقطع", key=f"pv_{ver}_{n}_{k}"):
+                                    o = opts[sa["clip_idx"]]
+                                    st.video(o.get("preview") or o["url"])
                             else:
-                                cols[i].caption("🎞️ بلا صورة")
-                            cols[i].caption(f"{i + 1} · {o['source']}" + (f" · {o['duration']}s" if o.get("duration") else ""))
-                        labels = ["بدون فيديو"] + [str(i + 1) for i in range(len(opts))]
-                        cur = a.get("clip_idx", 0)
-                        sel = st.radio("المقطع", labels, index=(cur + 1) if 0 <= cur < len(opts) else 0,
-                                       horizontal=True, key=f"sel_{n}", label_visibility="collapsed")
-                        a["clip_idx"] = -1 if sel == "بدون فيديو" else int(sel) - 1
-                        if a["clip_idx"] >= 0 and st.toggle("▶ معاينة المقطع", key=f"pv_{n}"):
-                            st.video(opts[a["clip_idx"]].get("preview") or opts[a["clip_idx"]]["url"])
-                    else:
-                        st.caption("ما لقيناش مقطع. غادي نستعملو خلفية متدرجة (جرّب كلمة بحث أخرى).")
-                        a["clip_idx"] = -1
+                                st.caption("ما لقيناش مقطع. غادي نستعملو خلفية متدرجة (بدّل وصف اللقطة).")
+                                sa["clip_idx"] = -1
             nav(prev=4)
 
 save_state()
