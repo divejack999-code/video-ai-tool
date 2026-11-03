@@ -404,7 +404,7 @@ SCHEMA_EXAMPLE = (
 )
 
 
-def gemini_json(api_key, models, prompt, log=lambda m: None):
+def gemini_json(api_key, models, prompt, log=lambda m: None, temperature=0.9):  # prompt: str أو قائمة (نص + صور)
     from google import genai
     from google.genai import types
     client = genai.Client(api_key=api_key)
@@ -413,7 +413,7 @@ def gemini_json(api_key, models, prompt, log=lambda m: None):
         try:
             r = client.models.generate_content(
                 model=m, contents=prompt,
-                config=types.GenerateContentConfig(response_mime_type="application/json", temperature=0.9))
+                config=types.GenerateContentConfig(response_mime_type="application/json", temperature=temperature))
             return parse_json_loose(r.text), m
         except Exception as e:
             last = e
@@ -587,8 +587,8 @@ def detect_silences(path, noise_db=-32, min_d=0.22):
     return [(max(0.0, a), b) for a, b in zip(starts, ends)]
 
 
-def split_audio_by_text(path, texts, out_prefix):
-    """يقطع ملفاً صوتياً واحداً إلى أجزاء بعدد النصوص، عند أقرب فراغ صامت للحدود المتوقعة (حسب طول كل نص)."""
+def sentence_bounds(path, texts):
+    """نهاية كل نص (بالثواني) داخل ملف صوتي واحد، مضبوطة على أقرب فراغ صامت للموضع المتوقع (حسب الطول)."""
     total = media_duration(path)
     weights = [max(1, len(re.sub(r"\s+", "", t))) for t in texts]
     wsum = float(sum(weights))
@@ -600,19 +600,26 @@ def split_audio_by_text(path, texts, out_prefix):
     bounds = [0.0]
     for i in range(len(texts) - 1):
         span = weights[i] / wsum * total
-        window = max(1.2, 0.35 * span)
+        window = max(1.0, 0.4 * span)
         best, best_score = None, None
         for a, b in sil:
             mid = (a + b) / 2
-            if abs(mid - expected[i]) <= window and mid > bounds[-1] + 0.8:
+            if abs(mid - expected[i]) <= window and mid > bounds[-1] + 0.6:
                 score = abs(mid - expected[i]) - 1.5 * (b - a)  # نفضّل الفراغ الأطول والأقرب
                 if best_score is None or score < best_score:
                     best, best_score = mid, score
         bounds.append(best if best is not None else expected[i])
-    bounds.append(total)
+    ends = bounds[1:] + [total]
+    return [round(e, 3) for e in ends]
+
+
+def split_audio_by_text(path, texts, out_prefix):
+    """يقطع ملفاً صوتياً واحداً إلى أجزاء بعدد النصوص."""
+    ends = sentence_bounds(path, texts)
+    starts = [0.0] + ends[:-1]
     outs = []
-    for i in range(len(texts)):
-        a, b = bounds[i], max(bounds[i] + 0.5, bounds[i + 1])
+    for i, (a, b) in enumerate(zip(starts, ends)):
+        b = max(a + 0.5, b)
         out = f"{out_prefix}_{i}.wav"
         r = subprocess.run([FFMPEG, "-y", "-ss", f"{a:.3f}", "-to", f"{b:.3f}", "-i", path,
                             "-af", "afade=t=in:d=0.015", "-ar", "24000", "-ac", "1", out],
@@ -883,8 +890,9 @@ def search_pexels(query, key, orient, n=6):
         if not files:
             continue
         best = min(files, key=lambda f: abs(min(f.get("width") or 0, f.get("height") or 0) - 720))
+        slug = re.sub(r"[-_/]+", " ", (v.get("url") or "").split("/video/")[-1])
         out.append({"source": "Pexels", "thumb": v.get("image"), "url": best["link"], "preview": best["link"],
-                    "duration": v.get("duration")})
+                    "duration": v.get("duration"), "meta": slug})
     return out
 
 
@@ -901,7 +909,7 @@ def search_pixabay(query, key, n=6):
             continue
         thumb = (pick.get("thumbnail") or prev.get("thumbnail") or None) if isinstance(pick, dict) else None
         out.append({"source": "Pixabay", "thumb": thumb, "url": pick["url"],
-                    "preview": (prev or pick).get("url"), "duration": h.get("duration")})
+                    "preview": (prev or pick).get("url"), "duration": h.get("duration"), "meta": h.get("tags", "")})
     return out
 
 
@@ -918,15 +926,24 @@ def make_thumb(video_url, dest, timeout=25):
     return dest
 
 
-def find_clips(query, orient, pexels_key, pixabay_key, n=6):
-    res, errs = [], []
-    for fn, args in ((search_pexels, (query, pexels_key, orient, n)), (search_pixabay, (query, pixabay_key, n))):
-        if not args[1]:
-            continue
-        try:
-            res += fn(*args)
-        except Exception as e:
-            errs.append(f"{fn.__name__}: {str(e)[:100]}")
+def find_clips(query, orient, pexels_key, pixabay_key, n=6, alts=None):
+    """يبحث بالكلمة الرئيسية ثم البدائل حتى نجمع n مقاطع مختلفة."""
+    res, errs, seen = [], [], set()
+    queries = [query] + [a for a in (alts or []) if a]
+    for q in queries:
+        for fn, args in ((search_pexels, (q, pexels_key, orient, n)), (search_pixabay, (q, pixabay_key, n))):
+            if not args[1]:
+                continue
+            try:
+                for o in fn(*args):
+                    if o["url"] not in seen:
+                        seen.add(o["url"])
+                        o["query"] = q
+                        res.append(o)
+            except Exception as e:
+                errs.append(f"{fn.__name__}: {str(e)[:100]}")
+        if len(res) >= n:
+            break
     if not res and " " in query.strip():  # جرّب أول كلمة فقط
         return find_clips(query.split()[0], orient, pexels_key, pixabay_key, n)
     return res[:n], errs
@@ -1009,25 +1026,234 @@ def caption_chunks(text, max_words):
 
 
 # ============================================================
+# لقطات لكل جملة + المخرج الذكي (Gemini)
+# ============================================================
+_SENT_END = re.compile(r"(?<=[\.\!\?\؟\…])\s+|\n+")
+CPS = 13.0  # عدد الحروف المنطوقة في الثانية تقريباً
+
+
+def split_sentences(text):
+    return [p.strip() for p in _SENT_END.split(text or "") if p and p.strip()]
+
+
+def make_shots(text, min_s=2.0, max_s=7.0):
+    """يقسّم حوار المشهد إلى لقطات: جملة لكل لقطة، مع دمج الجمل القصيرة وتقسيم الطويلة عند الفواصل."""
+    sents = split_sentences(text) or [(text or "").strip()]
+    pieces = []
+    for s_ in sents:
+        if len(s_) / CPS > max_s:
+            sub = [x.strip() for x in re.split(r"(?<=[\,\،\;\:])\s+", s_) if x.strip()]
+            pieces += sub if len(sub) > 1 else [s_]
+        else:
+            pieces.append(s_)
+    shots, cur = [], ""
+    for p in pieces:
+        cur = f"{cur} {p}".strip() if cur else p
+        if len(cur) / CPS >= min_s:
+            shots.append(cur)
+            cur = ""
+    if cur:
+        if shots:
+            shots[-1] = f"{shots[-1]} {cur}"
+        else:
+            shots.append(cur)
+    return shots or [""]
+
+
+def shots_sig(dialogue):
+    return hashlib.md5((dialogue or "").strip().encode("utf-8")).hexdigest()[:10]
+
+
+def _chunks(lst, n):
+    for i in range(0, len(lst), n):
+        yield lst[i:i + n]
+
+
+def plan_shots(api_key, models, project, language, tone, log=lambda m: None):
+    """مخرج ذكي: لكل جملة وصف لقطة إنجليزي دقيق (كلمة بحث + بدائل). يرجع {(scene, i): {...}}."""
+    out = {}
+    scenes = project["scenes"]
+    for chunk in _chunks(scenes, 6):
+        payload = [{"scene": s_["scene_number"], "location": s_.get("location", ""),
+                    "shots": [{"i": k, "sentence": sh["text"]} for k, sh in enumerate(s_["shots"])]} for s_ in chunk]
+        prompt = f"""You are a professional video editor choosing stock footage for a narrated video.
+Video title: {project.get('title', '')}. Style: {tone}. Narration language: {language}.
+For EVERY sentence, decide the shot that best illustrates its literal meaning, then write search queries for free stock-video libraries (Pexels/Pixabay).
+
+Rules:
+- keyword: 2-4 simple ENGLISH words describing something concrete and filmable that shows the sentence's meaning (subject + action/setting). Example: a sentence saying there was no internet -> "disconnected wifi laptop".
+- If the sentence is abstract, use a concrete visual metaphor that fits the mood.
+- alt: 2 alternative queries with different wording (the second broader), in case the first finds nothing.
+- visual: one short English sentence describing the shot.
+- Keep continuity inside a scene (same place/subject) but vary the shot type between consecutive sentences. Do not reuse the same keyword twice.
+- No brand names, no personal names, no on-screen text, no cartoons.
+Return valid JSON only, exactly: {{"scenes":[{{"scene":1,"shots":[{{"i":0,"keyword":"...","alt":["...","..."],"visual":"..."}}]}}]}}
+
+Input: {json.dumps(payload, ensure_ascii=False)}"""
+        data, used = gemini_json(api_key, models, prompt, log, temperature=0.5)
+        for sc in data.get("scenes", []):
+            for sh in sc.get("shots", []):
+                try:
+                    out[(int(sc["scene"]), int(sh["i"]))] = {
+                        "keyword": str(sh.get("keyword") or "").strip(),
+                        "alt": [str(a).strip() for a in (sh.get("alt") or []) if str(a).strip()][:2],
+                        "visual": str(sh.get("visual") or "").strip()}
+                except Exception:
+                    continue
+    return out
+
+
+def _tokens(t):
+    return set(re.findall(r"[a-z]{3,}", (t or "").lower()))
+
+
+def rank_by_text(queries, options):
+    """ترتيب احتياطي بالنص (وسوم Pixabay / عنوان Pexels) عند غياب الرؤية."""
+    qt = set().union(*[_tokens(q) for q in queries if q]) if queries else set()
+    scored = [(-(len(qt & _tokens(o.get("meta", "")))), i) for i, o in enumerate(options)]
+    return [i for _, i in sorted(scored)]
+
+
+def get_image_bytes(src, cache_dir):
+    if not src:
+        return None
+    if os.path.exists(str(src)):
+        with open(src, "rb") as f:
+            return f.read()
+    try:
+        dest = os.path.join(cache_dir, "img_" + hashlib.md5(str(src).encode()).hexdigest()[:12] + ".jpg")
+        download_file(src, dest, timeout=20)
+        with open(dest, "rb") as f:
+            return f.read()
+    except Exception:
+        return None
+
+
+def vision_rank(api_key, models, items, language="", log=lambda m: None):
+    """يطلب من Gemini (رؤية) ترتيب المقاطع المرشحة لكل جملة حسب مطابقتها لمعنى الجملة.
+    items: [{"text": str, "images": [bytes|None,...]}] ← يرجع [{"ranking":[...], "note": str}]"""
+    from google.genai import types
+    parts = [f"""You are a professional video editor. For each SHOT below you get a narration sentence (language: {language})
+and several candidate stock-footage thumbnails labelled OPTION n. Rank the options from best to worst by how well the image
+illustrates the MEANING of the sentence (subject, action, setting, mood). Penalize irrelevant, misleading, contradictory,
+text-heavy or watermarked images. Return valid JSON only:
+{{"shots":[{{"shot":0,"ranking":[2,0,1],"note":"short reason in Arabic"}}]}}
+Every option index of a shot must appear exactly once in its ranking."""]
+    for si, it in enumerate(items):
+        parts.append(f"=== SHOT {si} — sentence: {it['text']}")
+        for oi, b in enumerate(it["images"]):
+            if b:
+                parts.append(f"SHOT {si} · OPTION {oi}:")
+                parts.append(types.Part.from_bytes(data=b, mime_type="image/jpeg"))
+    last = None
+    for attempt in range(3):
+        try:
+            data, used = gemini_json(api_key, models, parts, log, temperature=0.1)
+            break
+        except Exception as e:
+            last = e
+            if "429" in str(e) or "RESOURCE_EXHAUSTED" in str(e):
+                log(f"حد الطلبات وصل، ننتظر {20 * (attempt + 1)} ث…")
+                time.sleep(20 * (attempt + 1))
+                continue
+            raise
+    else:
+        raise RuntimeError(f"vision فشل: {last}")
+    res = []
+    by_shot = {int(x.get("shot", -1)): x for x in data.get("shots", []) if isinstance(x, dict)}
+    for si, it in enumerate(items):
+        n = len(it["images"])
+        x = by_shot.get(si, {})
+        rk = [int(i) for i in (x.get("ranking") or []) if str(i).lstrip("-").isdigit() and 0 <= int(i) < n]
+        seen, clean = set(), []
+        for i in rk:
+            if i not in seen:
+                seen.add(i)
+                clean.append(i)
+        clean += [i for i in range(n) if i not in seen]
+        res.append({"ranking": clean, "note": str(x.get("note") or "")})
+    return res
+
+
+def pick_unique(rankings, options_list, used):
+    """يختار لكل لقطة أفضل مقطع غير مستعمل سابقاً في المشروع (تفادي التكرار)."""
+    picks = []
+    for rk, opts in zip(rankings, options_list):
+        pick = None
+        for oi in rk:
+            if oi < len(opts) and opts[oi]["url"] not in used:
+                pick = oi
+                break
+        if pick is None and rk:
+            pick = rk[0]
+        if pick is not None and pick < len(opts):
+            used.add(opts[pick]["url"])
+        picks.append(pick if pick is not None else -1)
+    return picks
+
+
+# ============================================================
 # الجدول الزمني
 # ============================================================
 VOICE_PAD = 0.7     # فراغ بعد الحوار
 VOICE_START = 0.25  # بداية الصوت داخل المشهد
 
 
-def build_timeline(scenes, assets, target, master_dur=None):
+MIN_SHOT = 0.8
+
+
+def get_shots(scene):
+    return scene.get("shots") or [{"text": scene.get("dialogue", ""), "keyword": scene.get("search_keyword", "")}]
+
+
+def _windows(shots, cuts, d):
+    """يحوّل نقاط القطع إلى نوافذ (start, dur) مع حد أدنى لمدة اللقطة."""
+    n = len(shots)
+    pts, prev = [0.0], 0.0
+    for k, c in enumerate(cuts):
+        remaining = n - 1 - k
+        c = min(max(c, prev + MIN_SHOT), d - MIN_SHOT * remaining)
+        pts.append(c)
+        prev = c
+    pts.append(d)
+    return [{"start": pts[k], "dur": max(0.1, pts[k + 1] - pts[k]), "text": shots[k].get("text", ""),
+             "keyword": shots[k].get("keyword", "")} for k in range(n)]
+
+
+def _prop_cuts(shots, t0, t1):
+    w = [max(1, len(re.sub(r"\s+", "", x.get("text", "")))) for x in shots]
+    tot, acc, cuts = float(sum(w)), 0.0, []
+    for x in w[:-1]:
+        acc += x
+        cuts.append(t0 + (t1 - t0) * acc / tot)
+    return cuts
+
+
+def build_timeline(scenes, assets, target, master_dur=None, master_bounds=None):
     n = len(scenes)
-    plan = [max(2.0, float(s.get("duration") or target / n)) for s in scenes]
+    shots_per = [get_shots(s) for s in scenes]
     if master_dur:
-        chars = [max(12, len(s.get("dialogue", ""))) for s in scenes]
-        tot = sum(chars)
-        durs = [master_dur * c / tot for c in chars]
-        t, items = 0.0, []
-        for s, d in zip(scenes, durs):
-            items.append({"n": s["scene_number"], "start": t, "dur": d, "voice_dur": d, "master_off": t})
+        total_shots = sum(len(x) for x in shots_per)
+        if master_bounds and len(master_bounds) == total_shots:
+            ends = list(master_bounds)
+        else:
+            w = [max(1, len(re.sub(r"\s+", "", x.get("text", "")))) for sh in shots_per for x in sh]
+            acc, ends = 0.0, []
+            for x in w:
+                acc += x
+                ends.append(master_dur * acc / sum(w))
+        t, k, items = 0.0, 0, []
+        for i, (s, sh) in enumerate(zip(scenes, shots_per)):
+            scene_end = master_dur if i == n - 1 else ends[k + len(sh) - 1]
+            d = max(1.0, scene_end - t)
+            cuts = [ends[k + j] - t for j in range(len(sh) - 1)]
+            items.append({"n": s["scene_number"], "start": t, "dur": d, "voice_dur": d, "master_off": t,
+                          "shots": _windows(sh, cuts, d)})
             t += d
+            k += len(sh)
         return {"items": items, "total": master_dur, "speed": 1.0, "overflow": False, "master": True}
 
+    plan = [max(2.0, float(s.get("duration") or target / n)) for s in scenes]
     vd = [float((assets.get(str(s["scene_number"]), {}) or {}).get("audio_dur") or 0) for s in scenes]
 
     def base(speed):
@@ -1050,8 +1276,17 @@ def build_timeline(scenes, assets, target, master_dur=None):
         durs = [d * k for d in durs]
         total = target
     t, items = 0.0, []
-    for s, d, v in zip(scenes, durs, vd):
-        items.append({"n": s["scene_number"], "start": t, "dur": d, "voice_dur": v / speed if v else 0.0})
+    for s, sh, d, v in zip(scenes, shots_per, durs, vd):
+        a = assets.get(str(s["scene_number"]), {}) or {}
+        bounds = a.get("bounds")
+        if v and bounds and len(bounds) == len(sh):
+            cuts = [VOICE_START + b / speed for b in bounds[:-1]]
+        elif v:
+            cuts = _prop_cuts(sh, VOICE_START, VOICE_START + v / speed)
+        else:
+            cuts = _prop_cuts(sh, 0.0, d)
+        items.append({"n": s["scene_number"], "start": t, "dur": d, "voice_dur": v / speed if v else 0.0,
+                      "shots": _windows(sh, cuts, d)})
         t += d
     return {"items": items, "total": total, "speed": speed, "overflow": overflow, "master": False}
 
@@ -1085,45 +1320,61 @@ def render_scene(scene, idx, item, assets, cfg, tl, work_dir, font_path, master_
     d = float(item["dur"])
     sn = str(scene["scene_number"])
     a = assets.get(sn, {}) or {}
+    a_shots = a.get("shots") or []
     closers, layers = [], []
+    OV = 0.15  # تداخل (crossfade) بين اللقطات
 
-    # --- الخلفية ---
-    clip_path = a.get("clip_path")
-    if clip_path and os.path.exists(clip_path):
-        try:
-            base = VideoFileClip(clip_path, audio=False)
-            closers.append(base)
-            base = _fit_cover(base, W, H)
-            base = base.subclipped(0, d) if base.duration >= d else base.with_effects([vfx.Loop(duration=d)])
-            layers.append(base.with_duration(d))
-        except Exception:
-            clip_path = None
-    if not layers:
-        bg = ImageClip(gradient_frame(W, H, idx)).with_duration(d)
-        layers.append(bg)
-        loc = scene.get("location") or ""
-        if loc:
-            im = text_image(loc, W * 0.8, font_path, max(24, W // 18), "#FFFFFF")
-            layers.append(ImageClip(im).with_duration(d).with_position(("center", "center")).with_opacity(0.85))
+    # --- لقطة لكل جملة ---
+    for k, sh in enumerate(item["shots"]):
+        path = a_shots[k].get("clip_path") if k < len(a_shots) else None
+        if not path and len(item["shots"]) == 1:
+            path = a.get("clip_path")
+        seg_start = max(0.0, sh["start"] - (OV if k > 0 else 0.0))
+        seg_dur = sh["start"] + sh["dur"] - seg_start
+        layer = None
+        if path and os.path.exists(path):
+            try:
+                base = VideoFileClip(path, audio=False)
+                closers.append(base)
+                base = _fit_cover(base, W, H)
+                base = base.subclipped(0, seg_dur) if base.duration >= seg_dur else base.with_effects([vfx.Loop(duration=seg_dur)])
+                layer = base.with_duration(seg_dur)
+            except Exception:
+                layer = None
+        if layer is None:
+            layer = ImageClip(gradient_frame(W, H, idx + k)).with_duration(seg_dur)
+            if k == 0 and scene.get("location"):
+                im = text_image(scene["location"], W * 0.8, font_path, max(24, W // 18), "#FFFFFF")
+                layer = CompositeVideoClip([layer, ImageClip(im).with_duration(seg_dur)
+                                            .with_position(("center", "center")).with_opacity(0.85)], size=(W, H))
+        layer = layer.with_start(seg_start)
+        if k > 0:
+            layer = layer.with_effects([vfx.CrossFadeIn(OV)])
+        layers.append(layer)
 
-    # --- الترجمة ---
-    voice_start = VOICE_START
-    voice_len = item["voice_dur"] if item["voice_dur"] else d - 0.6
-    if cfg.get("captions") and scene.get("dialogue"):
+    # --- الترجمة: نص كل لقطة في نافذتها بالضبط ---
+    if cfg.get("captions"):
         maxw = 5 if H > W else 8
-        chunks = caption_chunks(scene["dialogue"], maxw)
-        tot_chars = sum(len(c) for c in chunks) or 1
-        t0 = voice_start if not tl["master"] else 0.0
-        span = min(voice_len, d - t0)
-        for c in chunks:
-            seg = span * len(c) / tot_chars
-            if seg <= 0.05:
+        y = {"أسفل": H * 0.74, "وسط": H * 0.45, "أعلى": H * 0.12}.get(cfg["cap_pos"], H * 0.74)
+        for k, sh in enumerate(item["shots"]):
+            if not sh["text"].strip():
                 continue
-            im = text_image(c, W * 0.86, font_path, cfg["cap_size"], cfg["cap_color"])
-            y = {"أسفل": H * 0.74, "وسط": H * 0.45, "أعلى": H * 0.12}.get(cfg["cap_pos"], H * 0.74)
-            y = min(y, H - im.shape[0] - 10)
-            layers.append(ImageClip(im).with_start(t0).with_duration(seg).with_position(("center", y)))
-            t0 += seg
+            t_start = sh["start"] + (VOICE_START if (k == 0 and not tl["master"]) else 0.0)
+            t_end = sh["start"] + sh["dur"] - (0.08 if k < len(item["shots"]) - 1 else 0.3)
+            span = t_end - t_start
+            if span <= 0.2:
+                continue
+            chunks = caption_chunks(sh["text"], maxw)
+            tot_chars = sum(len(c) for c in chunks) or 1
+            t0 = t_start
+            for c in chunks:
+                seg = span * len(c) / tot_chars
+                if seg <= 0.05:
+                    continue
+                im = text_image(c, W * 0.86, font_path, cfg["cap_size"], cfg["cap_color"])
+                yy = min(y, H - im.shape[0] - 10)
+                layers.append(ImageClip(im).with_start(t0).with_duration(seg).with_position(("center", yy)))
+                t0 += seg
 
     # --- علامة مائية ---
     if cfg.get("watermark"):
@@ -1135,11 +1386,11 @@ def render_scene(scene, idx, item, assets, cfg, tl, work_dir, font_path, master_
     video = video.with_effects([vfx.FadeIn(0.2), vfx.FadeOut(0.2)])
 
     # --- الصوت ---
+    voice_start = VOICE_START
     sil = os.path.join(work_dir, "silence.wav")
     if not os.path.exists(sil):
         write_wav(sil, np.zeros(int(SR * 1.0)))
-    tracks = []
-    tracks.append(AudioFileClip(sil, fps=SR).with_effects([afx.AudioLoop(duration=d)]))
+    tracks = [AudioFileClip(sil, fps=SR).with_effects([afx.AudioLoop(duration=d)])]
     if tl["master"] and master_audio_path:
         ma = AudioFileClip(master_audio_path, fps=SR)
         closers.append(ma)
