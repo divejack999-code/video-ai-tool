@@ -25,9 +25,7 @@ FONT_DIR = os.path.join(DATA_DIR, "fonts")
 os.makedirs(os.path.join(DATA_DIR, "projects"), exist_ok=True)
 
 LANGS = list(E.EDGE_VOICES.keys())
-TONES = ["الكوميدية", "الأكشن والرسوم المتحركة", "الأفلام الموسيقية والرقص",
-         "ما بعد الكارثة / النجاة المستقبلية", "الفانتازيا والأسطوريات", "الجريمة والسرقة",
-         "التشويق", "الرعب","الإثارة", "الخيال العلمي", "الدراما", "إعلاني (تجاري)"]
+TONES = E.TONES
 PACES = {"سريع (≈4 ث / مشهد)": 4, "متوسط (≈7 ث / مشهد)": 7, "هادئ (≈10 ث / مشهد)": 10}
 VOICE_ENGINES = ["Gemini TTS (صوت بشري · الأفضل)", "Chatterbox (Hugging Face · تجريبي)", "Edge TTS (سريع · أقل طبيعية)"]
 SFX_MODES = ["تلقائي (Freesound ← ذكاء اصطناعي ← توليد محلي)", "Freesound فقط",
@@ -38,7 +36,7 @@ MUSIC_MODES = ["تلقائي (ACE-Step ← مكتبة CC0 ← توليد محل�
 M_AUTO, M_ACE, M_LIB, M_HF, M_LOCAL, M_UP, M_NONE = MUSIC_MODES
 
 CFG = {
-    "cfg_language": "الدارجة المغربية", "cfg_tone": "الكوميدية", "cfg_duration": 60,
+    "cfg_language": "الدارجة المغربية", "cfg_tone": "الكوميدية", "cfg_tone_custom": "", "cfg_duration": 60,
     "cfg_pace": "متوسط (≈7 ث / مشهد)", "cfg_aspect": "9:16 (ريلز / تيك توك)", "cfg_quality": "720p",
     "cfg_fps": 24, "cfg_voice_engine": VOICE_ENGINES[0], "cfg_gender": "ذكر", "cfg_voice_rate": 0,
     "cfg_gemini_voice": "Fenrir", "cfg_script_model": E.GEMINI_SCRIPT_FALLBACKS[0],
@@ -217,7 +215,10 @@ with st.sidebar:
     st.markdown("### ⚙️ إعدادات المشروع")
     with st.expander("🎞️ الفيديو", expanded=True):
         st.selectbox("اللغة / اللهجة", LANGS, key="cfg_language")
-        st.selectbox("الأسلوب", TONES, key="cfg_tone")
+        st.selectbox("الأسلوب", TONES, key="cfg_tone",
+                     help="كل أسلوب كيأثر على كتابة السيناريو، المؤثرات، والموسيقى. تقدر تكتب بحال بغيتي من «أسلوب مخصص».")
+        if ss.cfg_tone == E.CUSTOM_TONE:
+            st.text_input("اكتب أسلوبك", key="cfg_tone_custom", placeholder="مثال: وثائقي ساخر عن القطط بنبرة فيلسوف")
         st.slider("مدة الفيديو النهائي (ثانية)", 10, 600, step=5, key="cfg_duration",
                   help="الفيديو النهائي يخرج بهذه المدة (السيناريو والتركيب كيتكيّفو معها).")
         st.selectbox("إيقاع المونتاج", list(PACES), key="cfg_pace")
@@ -283,6 +284,13 @@ with st.sidebar:
 # دوال مساعدة
 # ============================================================
 STEPS = [("السيناريو", "📝"), ("التعليق الصوتي", "🎙️"), ("المؤثرات", "🔊"), ("الموسيقى", "🎵"), ("المونتاج", "🎬")]
+
+
+def cur_tone():
+    """الأسلوب الفعلي (المخصص إن اختاره المستخدم)."""
+    if ss.cfg_tone == E.CUSTOM_TONE:
+        return (ss.get("cfg_tone_custom") or "").strip() or "سينمائي متنوع"
+    return ss.cfg_tone
 
 
 def go(n):
@@ -544,7 +552,7 @@ with main:
             else:
                 with st.spinner("جاري كتابة السيناريو وتحديد المؤثرات لكل مشهد…"):
                     try:
-                        prompt = E.build_script_prompt(ss.cfg_language, ss.cfg_tone, topic, custom,
+                        prompt = E.build_script_prompt(ss.cfg_language, cur_tone(), topic, custom,
                                                        target(), PACES[ss.cfg_pace])
                         models = [ss.cfg_script_model] + [m for m in E.GEMINI_SCRIPT_FALLBACKS if m != ss.cfg_script_model]
                         data, used = E.gemini_json(key("gemini"), models, prompt)
@@ -879,7 +887,7 @@ with main:
                                 else:
                                     stt.write("توليد محلي…")
                                     p = os.path.join(ADIR, f"music_{int(time.time())}.wav")
-                                    E.write_wav(p, E.synth_music(prompt, 45, ss.cfg_tone))
+                                    E.write_wav(p, E.synth_music(prompt, 45, cur_tone()))
                                     result = (p, "توليد محلي")
                                 break
                             except Exception as e:
@@ -972,7 +980,7 @@ with main:
                 with st.status("المخرج الذكي كيخدم…", expanded=True) as stt:
                     stt.write("1) تحليل معنى كل جملة وكتابة وصف اللقطة…")
                     try:
-                        plan = E.plan_shots(gk, models_g, ss.project, ss.cfg_language, ss.cfg_tone, log=stt.write)
+                        plan = E.plan_shots(gk, models_g, ss.project, ss.cfg_language, cur_tone(), log=stt.write)
                         for s in scenes():
                             for k, sh in enumerate(s["shots"]):
                                 p = plan.get((s["scene_number"], k))
