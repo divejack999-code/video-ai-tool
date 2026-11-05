@@ -299,6 +299,13 @@ def synth_music(prompt="", dur=40.0, tone=""):
                            "أكشن", "الفانتازيا", "الأسطور", "الجريمة"])
     happy = _has_any(text, ["happy", "upbeat", "comedy", "funny", "pop", "fun", "bright", "summer",
                             "cheerful", "dance", "الكوميد", "إعلاني", "الإثارة"])
+    mood = tone_mood(tone)
+    if mood == "epic":
+        epic = True
+    elif mood == "dark":
+        dark = True
+    elif mood == "happy":
+        happy = True
     if epic and not happy:
         bpm, minor = 96, True
     elif dark and not happy:
@@ -379,6 +386,66 @@ def synth_music(prompt="", dur=40.0, tone=""):
 
 
 # ============================================================
+# الأساليب (Tones): إرشاد للسيناريو + مزاج الموسيقى
+# ============================================================
+CUSTOM_TONE = "✍️ أسلوب مخصص…"
+# أسلوب → (إرشاد للكاتب بالإنجليزية، مزاج الموسيقى المحلية)
+TONE_INFO = {
+    "الكوميدية": ("comedic, witty, playful timing, funny twists and exaggerated situations", "happy"),
+    "ستاند أب / ساخر": ("stand-up comedy, sarcastic observational humor, punchlines and callbacks", "happy"),
+    "الأكشن والرسوم المتحركة": ("fast-paced action, energetic and dynamic, animated-style adventure", "epic"),
+    "الأفلام الموسيقية والرقص": ("musical and dance energy, rhythmic, colorful, joyful performance", "happy"),
+    "الخيال العلمي": ("science fiction: futuristic technology, space, AI, robots, big what-if ideas, sense of wonder", "epic"),
+    "سايبربانك / مستقبل مظلم": ("cyberpunk: neon-lit dystopian megacity, hackers, corporations, rain and chrome, gritty noir narration", "dark"),
+    "ما بعد الكارثة / النجاة المستقبلية": ("post-apocalyptic survival, scarcity, lonely and tense, quiet desperation", "dark"),
+    "تاريخي": ("historical storytelling: accurate period details, dates, figures, a respectful documentary-like tone", "epic"),
+    "حرب وبطولة": ("war and heroism: courage, sacrifice, strategy, solemn and powerful narration", "epic"),
+    "الفانتازيا والأسطوريات": ("high fantasy and mythology: legends, magic, heroes and mythical creatures, grand storytelling", "epic"),
+    "تراث وحكايات شعبية": ("traditional folk tale told by a storyteller (hakawati), proverbs, moral lessons, warm oral style", "calm"),
+    "قصص أطفال": ("children's story: simple words, gentle humor, friendly characters, clear moral, very safe and kind", "happy"),
+    "الجريمة والسرقة": ("crime and heist: planning, tension, clever twists, noir investigation", "dark"),
+    "ألغاز وتحقيق": ("detective mystery: clues, suspects, deduction, a final reveal", "dark"),
+    "التشويق": ("thriller: rising suspense, short punchy sentences, cliffhangers", "dark"),
+    "الرعب": ("horror: dread, unsettling atmosphere, slow build-up and sudden scares", "dark"),
+    "الإثارة": ("high-stakes excitement, adrenaline, fast cuts and urgency", "happy"),
+    "الدراما": ("emotional drama: human relationships, inner conflict, sincere and moving", "dark"),
+    "حزين وعاطفي": ("melancholic and emotional, loss, memory, tender and reflective", "dark"),
+    "رومانسي": ("romantic: warm, intimate, poetic, longing and tenderness", "calm"),
+    "نوستالجيا / ريترو": ("nostalgic retro mood: childhood memories, old times, warm and sentimental", "calm"),
+    "مغامرات واستكشاف": ("adventure and exploration: discovery, journeys, nature, curiosity and wonder", "epic"),
+    "وثائقي": ("documentary: factual, calm authoritative narrator, clear explanations, interesting facts", "calm"),
+    "تعليمي / شرح مبسّط": ("educational explainer: clear step-by-step explanations, simple analogies, friendly teacher tone", "calm"),
+    "أخبار وتقارير": ("news report: neutral, concise, factual, headline style", "calm"),
+    "تحفيزي / تنمية ذاتية": ("motivational: inspiring, direct address to the viewer, powerful short sentences, call to action", "epic"),
+    "قصة نجاح / سيرة ذاتية": ("biography and success story: struggles, turning points, lessons learned", "epic"),
+    "حكمة وعِبَر": ("wisdom and life lessons: reflective short story with a meaningful moral", "calm"),
+    "روحاني / تأملي": ("spiritual and contemplative: serene, gentle, mindful reflection", "calm"),
+    "هادئ ومسترخٍ (ASMR)": ("calm, soothing, slow, whispery relaxing narration", "calm"),
+    "إعلاني (تجاري)": ("commercial ad: catchy hook, benefits, social proof, strong call to action", "happy"),
+    "ريفيو منتجات / تقنية": ("tech and product review: specs, pros and cons, honest verdict", "happy"),
+    "أعمال وريادة": ("business and entrepreneurship: strategy, numbers, startup stories, professional tone", "calm"),
+    "رياضي": ("sports: intense, competitive, highlights, commentator energy", "epic"),
+    "ألعاب فيديو (Gaming)": ("gaming: hype, game mechanics, funny reactions, gamer slang", "happy"),
+    "سفر وسياحة": ("travel and tourism: scenic places, local culture, tips, wanderlust", "happy"),
+    "طبخ وأكلات": ("food and cooking: sensory descriptions, ingredients, simple steps, mouth-watering", "happy"),
+    "صحة ولياقة": ("health and fitness: practical tips, energetic coaching tone, safe advice", "happy"),
+    "موضة وجمال": ("fashion and beauty: trends, style tips, confident and trendy voice", "happy"),
+    "أنمي / خيال ياباني": ("anime-inspired storytelling: dramatic emotions, power-ups, rivalry, heartfelt moments", "epic"),
+}
+TONES = list(TONE_INFO.keys()) + [CUSTOM_TONE]
+
+
+def tone_hint(tone):
+    info = TONE_INFO.get(tone)
+    return info[0] if info else ""
+
+
+def tone_mood(tone):
+    info = TONE_INFO.get(tone)
+    return info[1] if info else ""
+
+
+# ============================================================
 # Gemini: السيناريو
 # ============================================================
 def parse_json_loose(text):
@@ -430,8 +497,10 @@ def build_script_prompt(language, tone, topic, custom_script, target, pace):
     script_hint = ""
     if "الأمازيغية" in language:
         script_hint = "\nاكتب الحوار بالأمازيغية المغربية بالحرف اللاتيني (ليظهر في الترجمة النصية بشكل صحيح)."
+    th = tone_hint(tone)
+    style_hint = f"\nإرشادات الأسلوب (اتبعها في الحوار والمشاهد والمؤثرات والموسيقى): {th}." if th else ""
     return f"""أنت كاتب سيناريو ومخرج ومهندس صوت سينمائي محترف.
-المطلوب فيديو مدته الإجمالية {target} ثانية بالضبط، باللغة/اللهجة: {language}، وبأسلوب: {tone}.
+المطلوب فيديو مدته الإجمالية {target} ثانية بالضبط، باللغة/اللهجة: {language}، وبأسلوب: {tone}.{style_hint}
 {source}{script_hint}
 
 القواعد الصارمة:
